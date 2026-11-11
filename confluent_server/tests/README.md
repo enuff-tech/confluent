@@ -7,6 +7,7 @@ are needed.
 ## Running
 
 ```bash
+sudo apt-get install libarchive13t64    # or your distribution's libarchive
 python3 -m pip install -r confluent_server/tests/requirements.txt
 cd confluent_server
 python3 -m pytest
