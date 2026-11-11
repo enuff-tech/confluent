@@ -60,7 +60,7 @@ async def installation(confluent_config, monkeypatch, tmp_path):
     monkeypatch.setattr(disco, 'start_tenant_detection', lambda tenant: False)
     monkeypatch.setattr(services, 'start', lambda tenant: False)
     monkeypatch.setattr(netcfg, 'start', lambda tenant: False)
-    monkeypatch.setattr(tenantexport, 'SCRYPT_N', 2 ** 12)  # quick, for tests
+    monkeypatch.setattr(tenantexport, 'SCRYPT_N', 2 ** 14)  # quick, for tests
     monkeypatch.setattr(tenantexport, 'SUBSCRIPTIONS', str(tmp_path / 'no-subscriptions'))
     for tid, name in ((SRC, 'acme'), (OTHER, 'globex'), (DEST, 'initech'), (BACK, 'hooli')):
         _create(tid, name)

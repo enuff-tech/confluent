@@ -1,4 +1,5 @@
 import confluent.tlvdata as tlvdata
+import confluent.util as util
 import json
 import copy
 import base64
@@ -12,7 +13,10 @@ from webauthn import verify_registration_response
 from webauthn import verify_authentication_response
 
 
-challenges = {}
+# Challenges of logins and registrations under way. Asking for one needs
+# no authentication, so they are kept for a few minutes and no more than
+# so many at a time.
+challenges = util.ExpiringStore(lifetime=300, limit=1024)
 
 CONFIG_MANAGER = None
 
@@ -140,7 +144,7 @@ def registration_request(username, cfg, APP_RELYING_PARTY):
         user_id=user_model.user_handle,
         user_name=username)
 
-    challenges[options.challenge] = username
+    challenges.put(options.challenge, username)
     options_json = options_to_json(options)
     return options_json
 
@@ -164,7 +168,7 @@ async def registration_response(request, username, APP_RELYING_PARTY, APP_ORIGIN
     challenge = get_challenge_from_response(request)
     if challenge not in challenges:
         raise Exception("Could not find challenge")
-    chausername = challenges.pop(challenge, None)
+    chausername = challenges.take(challenge)
     if chausername != username:
         raise Exception("Challenge does not match username")
     user_model = User.get(username)
@@ -195,7 +199,7 @@ def authentication_request(username, APP_RELYING_PARTY):
         if not credential_model:
             raise Exception("No credential for user")
     options = generate_authentication_options(rp_id=APP_RELYING_PARTY.id)
-    challenges[options.challenge] = username
+    challenges.put(options.challenge, username)
     opts = options_to_json(options)
     return opts
 
@@ -208,7 +212,7 @@ def authentication_response(request, username, APP_RELYING_PARTY, APP_ORIGIN):
     if not user_model:
         raise Exception("Invalid Username")
     challenge = get_challenge_from_response(request)
-    expected_username = challenges.pop(challenge, None)
+    expected_username = challenges.take(challenge)
     if expected_username is None:
         raise Exception("No matching challenge")
     if not credential_model:

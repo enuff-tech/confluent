@@ -19,6 +19,13 @@ nodes (/self/sshcert), so that the nodes of a tenant recognize each other
 and nothing signed for one tenant is trusted by the nodes of another. Its
 public key is part of the tenant's site content (site/ssh/<tenant>.ca).
 
+A certificate is valid without an end unless a lifetime is set, as the
+authority of the installation signs them (a node asks for one when it is
+deployed, and does not ask again by itself):
+
+    [tenants]                      (in /etc/confluent/service.cfg)
+    sshcert_days = 400             a certificate is valid this long
+
 The authority's key is derived from the key the tenant's secrets are
 encrypted with: it is nowhere on disk, is the same on every collective
 member, and is gone with the tenant. Certificates are made in the service
@@ -26,10 +33,12 @@ itself (no ssh-keygen, no agent: a tenant's task starts no process).
 """
 
 import os
+import time
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ed25519
 
+import confluent.config.conf as conf
 import confluent.config.configmanager as configmanager
 import confluent.exceptions as exc
 
@@ -37,6 +46,18 @@ PURPOSE = b'confluent-tenant-ssh-ca'
 FOREVER = 2 ** 64 - 1
 MAX_KEY = 16384
 MAX_PRINCIPALS = 256
+BACKDATE = 300  # (clocks of nodes are not exact)
+
+
+def lifetime():
+    """How long a certificate is valid, in seconds, or None: without end."""
+    try:
+        days = float(conf.get_option('tenants', 'sshcert_days'))
+    except Exception:
+        return None
+    if not 0 < days < 36500:
+        return None
+    return int(days * 86400)
 
 
 def available():
@@ -84,15 +105,19 @@ def sign_host_key(tenant, pubkey, nodename, principals=()):
     names.add(nodename)
     if len(names) > MAX_PRINCIPALS:
         raise exc.InvalidArgumentException('Too many names for one certificate')
-    certificate = (
+    valid = lifetime()
+    now = int(time.time())
+    builder = (
         serialization.SSHCertificateBuilder()
         .public_key(_host_key(pubkey))
         .serial(int.from_bytes(os.urandom(8), 'big') >> 1)
         .type(serialization.SSHCertificateType.HOST)
         .key_id(nodename.encode('utf8'))
-        .valid_principals([name.encode('utf8') for name in sorted(names)])
+        .valid_principals([name.encode('utf8') for name in sorted(names)]))
+    if valid:
+        builder = builder.valid_after(now - BACKDATE).valid_before(now + valid)
+    else:
         # (as the authority of the installation does: without an end)
-        .valid_after(0)
-        .valid_before(FOREVER)
-        .sign(_key(tenant)))
+        builder = builder.valid_after(0).valid_before(FOREVER)
+    certificate = builder.sign(_key(tenant))
     return certificate.public_bytes().decode('ascii') + ' ' + nodename + '\n'

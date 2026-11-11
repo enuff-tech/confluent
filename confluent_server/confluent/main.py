@@ -45,6 +45,7 @@ import confluent.consoleserver as consoleserver
 import confluent.core as confluentcore
 import confluent.httpapi as httpapi
 import confluent.log as log
+import confluent.tenantpaths as tenantpaths
 import confluent.collective.manager as collective
 import linecache
 try:
@@ -416,6 +417,11 @@ async def asyncrun(args):
         # there is nothing to unwind beyond what stopping normally does
         return _finish_shutdown()
     disco.start_detection()
+    try:
+        # what an interrupted deletion of a tenant left on disk
+        await asyncio.to_thread(tenantpaths.finish_deletions)
+    except Exception:
+        log.logtrace()
     tenantservices.start_all()
     tenantnetcfg.start_all()
     await asyncio.sleep(1)

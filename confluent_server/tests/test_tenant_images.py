@@ -313,17 +313,30 @@ async def test_media_is_only_ever_the_tenants_own(images):
 async def test_a_tenants_media_is_read_by_a_limited_worker(images, monkeypatch):
     await _import(A)
     # found out by a process of the service, limited, not within the tenant
-    assert images['identified'] == [
-        (None, os.path.join(tenantpaths.media_root(A), 'rocky.iso'), osimage._limit_worker)]
+    media = os.path.join(tenantpaths.media_root(A), 'rocky.iso')
+    (tenant, named, confined), = images['identified']
+    assert (tenant, named) == (None, media)
+    # confined to reading that media, and writing nothing
+    assert media in confined.read and confined.write == ()
     spawned = []
     real = osimage.asyncio.create_subprocess_exec
 
     async def spawn(*args, **kwargs):
-        spawned.append(kwargs.get('preexec_fn'))
+        spawned.append(kwargs)
         return await real(*args, **kwargs)
     monkeypatch.setattr(osimage.asyncio, 'create_subprocess_exec', spawn)
     await _import(B)
-    assert spawned == [osimage._limit_worker, osimage._limit_worker]
+    identify, unpack = spawned
+    media = os.path.join(tenantpaths.media_root(B), 'rocky.iso')
+    assert media in identify['preexec_fn'].read and identify['preexec_fn'].write == ()
+    # the one that unpacks may write that tenant's distributions, only
+    assert media in unpack['preexec_fn'].read
+    assert unpack['preexec_fn'].write == (tenantpaths.distributions_root(B),)
+    # and neither holds the files the service has open
+    assert identify['close_fds'] is True and unpack['close_fds'] is True
+    for kwargs in spawned:
+        assert not [p for p in kwargs['preexec_fn'].read + kwargs['preexec_fn'].write
+                    if p.startswith(tenantpaths.base(A))]
 
 
 @pytest.mark.parametrize('identity', [
