@@ -372,6 +372,11 @@ class TenantNetworkRef(object):
     def resolver(self):
         return TenantResolver(self)
 
+    async def alist_interfaces(self):
+        """The interfaces of the tenant's namespace, as the broker reports
+        them (name, index, up, mac, ipv4 and ipv6 address/prefix lists)."""
+        return await self._net().alist_interfaces()
+
 
 class TenantResolver(aiohttp.abc.AbstractResolver):
     """aiohttp name resolution within a tenant's network."""

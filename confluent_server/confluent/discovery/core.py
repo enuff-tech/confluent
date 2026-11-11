@@ -88,6 +88,9 @@ import confluent.messages as msg
 import confluent.networking.macmap as macmap
 import confluent.noderange as noderange
 import confluent.tasks as tasks
+import confluent.tenantguard as tenantguard
+import confluent.tenantnet as tenantnet
+import confluent.tenantstate as tenantstate
 import confluent.util as util
 import inspect
 import json
@@ -188,7 +191,7 @@ servicebyname = {
     'lenovo-tsm': 'service:lenovo-tsm',
 }
 
-runningevals = {}
+runningevals = tenantstate.TenantScoped()
 # Passive-only auto-detection protocols:
 # PXE
 
@@ -217,14 +220,26 @@ runningevals = {}
 
 
 #TODO: by serial, by uuid, by node
-known_info = {}
-known_services = {}
-known_serials = {}
-known_uuids = nesteddict()
-known_nodes = nesteddict()
-unknown_info = {}
-pending_nodes = {}
-pending_by_uuid = {}
+# Each tenant discovers its own hardware: all of this is kept per tenant
+# (see tenantstate), so identical MACs, UUIDs, serials and addresses in two
+# tenants are two separate records.
+known_info = tenantstate.TenantScoped()
+known_services = tenantstate.TenantScoped()
+known_serials = tenantstate.TenantScoped()
+known_uuids = tenantstate.TenantScoped(nesteddict)
+known_nodes = tenantstate.TenantScoped(nesteddict)
+unknown_info = tenantstate.TenantScoped()
+pending_nodes = tenantstate.TenantScoped()
+pending_by_uuid = tenantstate.TenantScoped()
+
+
+def _current_cfm():
+    """The configuration of the tenant the current task works for."""
+    return cfm.ConfigManager(tenantguard.current_tenant.get())
+
+
+def _in_tenant():
+    return tenantguard.current_tenant.get() is not None
 
 def register_affluent(affluenthdl):
     global affluent
@@ -544,6 +559,23 @@ def handle_autosense_config(operation, inputdata):
         else:
             stop_autosense()
 
+def handle_tenant_autosense_config(configmanager, operation, inputdata):
+    """A tenant's own autosense setting. Listening for it in the tenant's
+    networks comes with per-tenant discovery listeners."""
+    autosense = configmanager.get_scoped_global('discovery.autosense')
+    autosense = autosense or autosense is None
+    if operation == 'retrieve':
+        return [msg.KeyValueData({'enabled': autosense})]
+    if operation == 'update':
+        enabled = inputdata['enabled']
+        if type(enabled) in (unicode, bytes):
+            enabled = enabled.lower() in ('true', '1', 'y', 'yes', 'enable',
+                                          'enabled')
+        configmanager.set_scoped_global('discovery.autosense', bool(enabled))
+        return [msg.KeyValueData({'enabled': bool(enabled)})]
+    raise exc.InvalidArgumentException('Unsupported operation')
+
+
 def get_subscriptions():
     try:
         with open('/etc/confluent/discovery_subscriptions.json', 'r') as ds:
@@ -592,7 +624,15 @@ async def register_remote_addrs(addresses, configmanager):
 
 async def handle_api_request(configmanager, inputdata, operation, pathcomponents):
     if pathcomponents == ['discovery', 'autosense']:
+        if configmanager.tenant is not None:
+            return handle_tenant_autosense_config(configmanager, operation, inputdata)
         return handle_autosense_config(operation, inputdata)
+    if pathcomponents[:2] == ['discovery', 'subscriptions'] and configmanager.tenant is not None:
+        # Subscriptions register this server with remote discovery agents
+        # (affluent) for the host; tenants have none.
+        if operation == 'retrieve':
+            return []
+        raise exc.ForbiddenRequest('Discovery subscriptions are not available within a tenant')
     if operation == 'retrieve' and pathcomponents[:2] == ['discovery', 'subscriptions']:
         if len(pathcomponents) > 2:
             raise Exception('TODO')
@@ -676,7 +716,7 @@ def handle_read_api_request(pathcomponents):
     #  odd indexes into components are 'by-'*, even indexes
     # starting at 2 are parameters to previous index
     if pathcomponents == ['discovery', 'rescan']:
-        return (msg.KeyValueData({'scanning': bool(scanner)}),)
+        return (msg.KeyValueData({'scanning': bool(scanner) and not _in_tenant()}),)
     if pathcomponents == ['discovery', 'alldata']:
         return dump_discovery()
     subcats, queryparms, indexof, coll = _parameterize_path(pathcomponents[1:])
@@ -887,7 +927,7 @@ async def detected(info):
             # in that case, however, a user can clear pubkeys to force a check
             return
     merge_info(known_info, info['info_identifier'], info)
-    cfg = cfm.ConfigManager(None)
+    cfg = _current_cfm()
     if handler:
         handler = handler.NodeHandler(info, cfg)
         res = handler.scan()
@@ -1531,6 +1571,13 @@ async def discover_node(cfg, handler, info, nodename, manual):
                 return False
             nodeconfig = cfg.get_node_attributes(nodename, 'discovery.nodeconfig')
             nodeconfig = nodeconfig.get(nodename, {}).get('discovery.nodeconfig', {}).get('value', None)
+            if nodeconfig and _in_tenant():
+                # nodeconfig is a separate process, which tenant
+                # tasks may not start
+                log.log({'error': 'discovery.nodeconfig is not available '
+                                  'within a tenant; not applied to '
+                                  '{0}'.format(nodename)})
+                nodeconfig = None
             if nodeconfig:
                 nodeconfig = shlex.split(nodeconfig)
             newnodeattribs = {}
@@ -1568,8 +1615,7 @@ async def discover_node(cfg, handler, info, nodename, manual):
                 else:
                     bmcaddr = bmcaddr.split('/', 1)[0]
                     await wait_for_connection(bmcaddr)
-                    loop = asyncio.get_running_loop()
-                    await loop.getaddrinfo(bmcaddr, 443)
+                    await netutil._getaddrinfo(bmcaddr, 443)
             if nodeconfig:
                     await util.check_call(['/opt/confluent/bin/nodeconfig', nodename] + nodeconfig)
                     log.log({'info': 'Configured {0} ({1})'.format(nodename,
@@ -1603,6 +1649,15 @@ async def discover_node(cfg, handler, info, nodename, manual):
 async def wait_for_connection(bmcaddr):
     cloop = asyncio.get_running_loop()
     expiry = 75 + util.monotonic_time()
+    if tenantnet.current_network() is not None:
+        while util.monotonic_time() < expiry:
+            try:
+                sock = await tenantnet.aconnect(bmcaddr, 443, timeout=1)
+                sock.close()
+                return
+            except Exception:
+                await asyncio.sleep(1)
+        return
     while util.monotonic_time() < expiry:
         for addrinf in await cloop.getaddrinfo(bmcaddr, 443, proto=socket.IPPROTO_TCP):
             try:
@@ -1724,6 +1779,13 @@ async def _periodic_recheck(configmanager):
 
 async def rescan(aggressive=False):
     _map_unique_ids()
+    if _in_tenant():
+        # Re-evaluate what this tenant has detected. Scanning a tenant's
+        # networks needs listeners in them, which tenants do not have yet.
+        cfg = _current_cfm()
+        for mac in list(unknown_info):
+            await _recheck_single_unknown(cfg, mac)
+        return
     global scanner
     if scanner:
         return
@@ -1732,6 +1794,8 @@ async def rescan(aggressive=False):
     await remotescan()
 
 async def remotescan():
+    if _in_tenant():
+        return  # discovery subscriptions are the host's (affluent)
     mycfm = cfm.ConfigManager(None)
     myname = collective.get_myname()
     for remagent in get_subscriptions():
@@ -1777,8 +1841,7 @@ async def generic_eval(address, hwaddr=None):
     ports = await netutil.peer_reachable(address)
     if not ports:
         return None
-    cloop = asyncio.get_running_loop()
-    addrinfo = await cloop.getaddrinfo(
+    addrinfo = await netutil._getaddrinfo(
             address, 443, family=socket.AF_UNSPEC, type=socket.SOCK_STREAM)
     
     if not addrinfo:
@@ -1820,7 +1883,7 @@ def start_detection():
     global rechecker
     global rechecktime
     _map_unique_ids()
-    cfg = cfm.ConfigManager(None)
+    cfg = _current_cfm()
     allnodes = cfg.list_nodes()
     attribwatcher = cfg.watch_attributes(
         allnodes, ('discovery.policy', 'net*.switch',
@@ -1846,20 +1909,17 @@ def start_autosense():
     tasks.spawn(remotescan())
 
 
-nodes_by_fprint = {}
-nodes_by_uuid = {}
-known_pxe_uuids = {}
+nodes_by_fprint = tenantstate.TenantScoped()
+nodes_by_uuid = tenantstate.TenantScoped()
+known_pxe_uuids = tenantstate.TenantScoped()
 
 def _map_unique_ids(nodes=None):
-    global nodes_by_uuid
-    global nodes_by_fprint
-    global known_pxe_uuids
     # Map current known ids based on uuid and fingperprints for fast lookup
-    cfg = cfm.ConfigManager(None)
+    cfg = _current_cfm()
     if nodes is None:
-        nodes_by_uuid = {}
-        nodes_by_fprint = {}
-        known_pxe_uuids = {}
+        nodes_by_uuid.clear()
+        nodes_by_fprint.clear()
+        known_pxe_uuids.clear()
         nodes = cfg.list_nodes()
     bigmap = cfg.get_node_attributes(nodes,
                                      ('id.uuid',
