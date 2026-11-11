@@ -54,6 +54,20 @@ import confluent.exceptions as exc
 FORMAT = 'confluent-tenant-export'
 VERSION = 1
 SCRYPT_N = 2 ** 17
+# What a package to import may ask for and bring (it comes from elsewhere):
+# a work factor between these, files of at most this size.
+SCRYPT_MIN_N, SCRYPT_MAX_N = 2 ** 14, 2 ** 18
+MAX_FILES = 64
+MAX_FILE_SIZE = 256 * 2 ** 20
+MAX_SALT = 64
+
+
+def _limited_read(path, name):
+    with open(path, 'rb') as f:
+        data = f.read(MAX_FILE_SIZE + 1)
+    if len(data) > MAX_FILE_SIZE:
+        raise PackageError('The package is not acceptable: {0} is too large'.format(name))
+    return data
 STORE_GLOBALS = ('discovery.autosense',)
 IMPORTED = 'import.manifest_sha256'
 SUBSCRIPTIONS = '/etc/confluent/discovery_subscriptions.json'
@@ -174,21 +188,23 @@ def write(files, directory):
 def read(directory):
     """Read a package from a directory, checking it against its manifest."""
     try:
-        with open(os.path.join(directory, 'manifest.json'), 'rb') as f:
-            manifestdata = f.read()
+        manifestdata = _limited_read(os.path.join(directory, 'manifest.json'), 'manifest.json')
         manifest = json.loads(manifestdata)
     except (OSError, ValueError) as e:
         raise PackageError('Not a tenant export package: {0}'.format(e))
+    if not isinstance(manifest, dict):
+        raise PackageError('Not a tenant export package')
     if manifest.get('format') != FORMAT or manifest.get('version') != VERSION:
         raise PackageError('Unsupported package format or version')
+    if not isinstance(manifest.get('files', {}), dict) or len(manifest.get('files', {})) > MAX_FILES:
+        raise PackageError('The package is not acceptable: too many files')
     files = {'manifest.json': manifestdata}
     for name, digest in sorted(manifest.get('files', {}).items()):
         path = os.path.realpath(os.path.join(directory, name))
         if not path.startswith(os.path.join(os.path.realpath(directory), '')):
             raise PackageError('Invalid file name in the package: {0}'.format(name))
         try:
-            with open(path, 'rb') as f:
-                data = f.read()
+            data = _limited_read(path, name)
         except OSError:
             raise PackageError('The package is incomplete: {0} is missing'.format(name))
         if _sha(data) != digest:
@@ -211,9 +227,14 @@ def _unlock(files, passphrase):
         raise PackageError('A passphrase is needed to import this package')
     try:
         n = int(keys['n'])
-        if n > 2 ** 20 or n & (n - 1):
+        if not SCRYPT_MIN_N <= n <= SCRYPT_MAX_N or n & (n - 1):
             raise ValueError(n)
-        derived = _derive(passphrase, base64.b64decode(keys['salt']), n)
+        if keys.get('r', 8) != 8 or keys.get('p', 1) != 1:
+            raise ValueError('parameters')
+        salt = base64.b64decode(keys['salt'])
+        if not 8 <= len(salt) <= MAX_SALT:
+            raise ValueError('salt')
+        derived = _derive(passphrase, salt, n)
         return configmanager.decrypt_value(_decode(keys['packagekey']), key=derived)
     except Exception:
         raise PackageError('Wrong passphrase (or damaged package key)')

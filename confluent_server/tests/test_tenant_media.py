@@ -463,6 +463,8 @@ async def test_the_identifying_worker_for_real(tmp_path, monkeypatch):
     stuck = tmp_path / 'stuck.py'
     stuck.write_text('import time\ntime.sleep(60)\n')
     monkeypatch.setattr(osimage, '__file__', str(stuck))
+    # (a confined worker reads what the interpreter is told to look in)
+    monkeypatch.setenv('PYTHONPATH', os.environ['PYTHONPATH'] + os.pathsep + str(tmp_path))
     started = asyncio.get_running_loop().time()
     with pytest.raises(exc.InvalidArgumentException):
         await osimage.identify_in_worker(str(garbage))

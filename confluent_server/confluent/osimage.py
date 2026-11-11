@@ -26,6 +26,7 @@ if __name__ == '__main__':
 
 import confluent.exceptions as exc
 import confluent.messages as msg
+import confluent.sandbox as sandbox
 import confluent.tasks as tasks
 import confluent.tenantguard as tenantguard
 import confluent.tenantpaths as tenantpaths
@@ -125,9 +126,6 @@ EXTRACT_SECURE = 0x0100 | 0x0200 | 0x10000
 # What media may call itself (names become directory names).
 MEDIA_NAME_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$')
 IDENTIFY_SECONDS = 180
-WORKER_CPU_SECONDS = 4 * 3600
-WORKER_MEMORY = 4 * 2 ** 30
-WORKER_FILE_SIZE = 64 * 2 ** 30
 
 
 def checked_identity(identity):
@@ -145,16 +143,14 @@ def checked_identity(identity):
     return identity
 
 
-def _limit_worker():
-    # A process handling a tenant's media: bounded in time, memory and
-    # the size of any file it writes, and in a session of its own.
-    import resource
-    os.setsid()
-    os.umask(0o022)
-    resource.setrlimit(resource.RLIMIT_CPU, (WORKER_CPU_SECONDS, WORKER_CPU_SECONDS))
-    resource.setrlimit(resource.RLIMIT_AS, (WORKER_MEMORY, WORKER_MEMORY))
-    resource.setrlimit(resource.RLIMIT_FSIZE, (WORKER_FILE_SIZE, WORKER_FILE_SIZE))
-    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+def _worker_env(base):
+    # (the library is named to the worker: looking for it takes tools
+    # and a temporary directory that a confined worker does not have)
+    env = dict(os.environ, CONFLUENT_IMAGE_BASE=base)
+    found = getattr(libarchive.ffi, 'libarchive_path', None)
+    if found and 'LIBARCHIVE' not in env:
+        env['LIBARCHIVE'] = found
+    return env
 
 
 async def identify_in_worker(filename):
@@ -163,8 +159,10 @@ async def identify_in_worker(filename):
     worker = await asyncio.create_subprocess_exec(
         sys.executable, __file__, filename, '--identify',
         stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.DEVNULL, preexec_fn=_limit_worker,
-        env=dict(os.environ, CONFLUENT_IMAGE_BASE=image_base()))
+        stderr=asyncio.subprocess.DEVNULL, close_fds=True,
+        # (it may read the media, and write nothing)
+        preexec_fn=sandbox.confiner(read=[filename]),
+        env=_worker_env(image_base()))
     try:
         output, _ = await asyncio.wait_for(worker.communicate(), IDENTIFY_SECONDS)
     except asyncio.TimeoutError:
@@ -1581,12 +1579,20 @@ class MediaImporter(object):
     async def importmedia(self):
         if self.medfile:
             os.environ['CONFLUENT_MEDIAFD'] = '{0}'.format(self.medfile.fileno())
+        confined = None
+        if self.limited:
+            # A tenant's media is unpacked by a worker that may read the
+            # media, write the tenant's distributions, and holds none of
+            # the files the service has open.
+            distributions = _p('/var/lib/confluent/distributions')
+            os.makedirs(distributions, mode=0o755, exist_ok=True)
+            confined = sandbox.confiner(read=[self.filename], write=[distributions])
         self.worker = await asyncio.create_subprocess_exec(
             sys.executable, __file__, self.filename, '-b',
             self.targpath, self.distpath, self.customname,
-            stdout=asyncio.subprocess.PIPE, close_fds=False,
-            preexec_fn=_limit_worker if self.limited else None,
-            env=dict(os.environ, CONFLUENT_IMAGE_BASE=self.base))
+            stdout=asyncio.subprocess.PIPE, close_fds=self.limited,
+            preexec_fn=confined,
+            env=_worker_env(self.base))
         wkr = self.worker
         currline = b''
         while wkr.returncode is None:

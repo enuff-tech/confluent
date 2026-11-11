@@ -88,10 +88,36 @@ def public_path(tenant, *parts):
     return os.path.join(public_root(tenant), *parts)
 
 
+MARKERS = '.deleted'
+
+
 def remove_tenant(tenant):
     """Delete a tenant's deployment trees (and nothing else: the path is
     derived from the validated id and removed without following links)."""
     configmanager._remove_tenant_directory(BASE, tenant)
+
+
+def _marker(tenant):
+    return os.path.join(BASE, 'tenants', MARKERS, tenant)
+
+
+def _mark_deleted(tenant):
+    # A note that outlasts the service: what is deleted below takes a
+    # while, and is finished at the next start if it is interrupted.
+    try:
+        os.makedirs(os.path.dirname(_marker(tenant)), mode=0o700, exist_ok=True)
+        with open(_marker(tenant), 'w'):
+            pass
+    except OSError:
+        pass
+
+
+def _remove_everything(tenant):
+    remove_tenant(tenant)
+    try:
+        os.unlink(_marker(tenant))
+    except OSError:
+        pass
 
 
 def _tenant_state_changed(tenant, state):
@@ -99,12 +125,48 @@ def _tenant_state_changed(tenant, state):
         return
     # what was kept for the tenant on disk goes with it: its logs, and
     # its deployment content
+    _mark_deleted(tenant)
     log.remove_tenant(tenant)
     try:
         # images are large: off the event loop
-        asyncio.get_running_loop().run_in_executor(None, remove_tenant, tenant)
+        asyncio.get_running_loop().run_in_executor(None, _remove_everything, tenant)
     except RuntimeError:
-        remove_tenant(tenant)
+        _remove_everything(tenant)
+
+
+def finish_deletions():
+    """Remove what is left on disk of tenants that no longer exist: the
+    deletions that were under way when the service last stopped, and (on
+    an installation that is not part of a collective, where the tenants
+    known here are all there are) any tree no tenant belongs to.
+
+    Called when the service starts; returns the ids cleaned up.
+    """
+    known = set(configmanager.list_tenants())
+    leftover = set()
+    try:
+        leftover.update(os.listdir(os.path.dirname(_marker('x'))))
+    except OSError:
+        pass
+    if not list(configmanager.list_collective()):
+        for directory in (BASE, log.base_directory()):
+            try:
+                leftover.update(os.listdir(os.path.join(directory, 'tenants')))
+            except OSError:
+                pass
+    done = []
+    for tenant in sorted(leftover):
+        if not configmanager.valid_tenant_id(tenant):
+            continue
+        if tenant not in known:
+            log.remove_tenant(tenant)
+            remove_tenant(tenant)
+            done.append(tenant)
+        try:
+            os.unlink(_marker(tenant))
+        except OSError:
+            pass
+    return done
 
 
 configmanager.watch_tenant_state(_tenant_state_changed)

@@ -26,7 +26,11 @@ and command line they cannot read, change or act on a tenant's
 infrastructure. Tenant network traffic is confined by Linux network
 namespaces. Confluent obtains tenant sockets only through a per-tenant
 broker, and refuses (fails closed) rather than use the host's network for
-a tenant's work.
+a tenant's work. That refusal is a safeguard against mistakes in confluent
+itself, not the boundary: it sees what the service does with sockets from
+Python, and would not see a socket opened by native code inside a library.
+The boundary is the namespace, and that only the tenant's broker can make
+sockets in it.
 
 **What it does not protect against.** The host's root user, and anyone who
 can run code as the `confluent` service user, keep full visibility and
@@ -85,7 +89,8 @@ its users and API keys are refused, its discovery, consoles and node
 services stop, and every socket in its network is closed. Only a disabled
 tenant can be deleted. **Deleting a tenant removes its configuration, its
 logs and its deployment content, and cannot be undone**; export it first
-if it may be needed (see below).
+if it may be needed (see below). Should the service stop while that is
+under way, what is left on disk is removed when it starts again.
 
 Tenant users work with the usual commands and API, logging in as
 `tenant/user`. API keys (version 2) are bound to the tenant of the user
@@ -197,6 +202,18 @@ is not stored anywhere; it needs version 40 or later of the Python
 cryptography library. The service has no SSH key of its own that a
 tenant's nodes accept: it does not log in to them.
 
+A host certificate has no end, as those of a single-tenant installation,
+unless a lifetime is set in `/etc/confluent/service.cfg`:
+
+    [tenants]
+    sshcert_days = 400
+
+A node asks for its certificate when it is deployed and does not renew it
+by itself, so a lifetime has to outlast the time until a node is deployed
+again, or the node's `setupssh` script has to be run again before it ends.
+Without one, the host key of a node that was retired stays trusted by the
+other nodes of its tenant.
+
 A tenant administrator uploads OS installation media, imports it, and
 manages the profiles made from it through `/deployment`:
 
@@ -227,11 +244,18 @@ a tenant may keep there is set in `/etc/confluent/service.cfg`:
 `filename` names a file in the tenant's `media` directory, never a path
 of the host. The tools this takes (unpacking media, building boot images)
 run as the service itself, on the tenant's trees only. A tenant's media
-is not trusted: it is identified and unpacked by worker processes limited
-in time, memory and file size, nothing it contains is written outside the
-directory it is unpacked into, and the names it gives itself have to be
-plain ones. Those workers still run as the service user (see Security
-boundaries). Ready-made profile
+is not trusted: it is identified and unpacked by worker processes,
+nothing it contains is written outside the directory it is unpacked into,
+and the names it gives itself have to be plain ones. The workers run as
+the service user, confined with what the host's kernel offers to an
+unprivileged process: limits on CPU time, memory and file size, and none
+of the service's open files, always; namespaces of their own (no network,
+none of the service's sockets) where unprivileged user namespaces are
+allowed; and Landlock (Linux 5.13 or later), with which a worker can open
+only the interpreter and its libraries, the media, and, to unpack, the
+tenant's distributions. `python3 -c 'import confluent.sandbox as s;
+print(s.applied())'`, run as the service user, tells which of these a host
+provides. Ready-made profile
 archives are not imported within a tenant, and rebasing only copies from
 the product's packaged profile content. Profiles are not editable through
 the API: customizing one (kernel arguments, scripts) is done in the
@@ -265,7 +289,10 @@ installation of its own, and the other way round:
 the nodes, groups, attributes, users and discovery settings. Secrets are
 encrypted under a key made for the package, protected by the passphrase;
 no key of the source installation is in it. `-r` writes a redacted package
-without secrets, for reading only.
+without secrets, for reading only. A package to import is treated as
+coming from elsewhere: it is refused if it asks for more (or less) work to
+unlock than packages are written with, or holds more or larger files than
+an export does.
 
 Import needs the service stopped and an empty destination; it checks the
 whole package before changing anything, keeps the users the destination

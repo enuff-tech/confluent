@@ -43,6 +43,56 @@ except ImportError:
 import confluent.tasks as tasks
 
 
+class ExpiringStore(object):
+    """Things remembered for a while, and only so many of them.
+
+    For what anyone may cause the service to remember (the challenge of a
+    login that may never be completed): an entry is forgotten after
+    lifetime seconds, and the oldest ones make room once there are limit
+    of them.
+    """
+
+    def __init__(self, lifetime, limit, clock=None):
+        self.lifetime = lifetime
+        self.limit = limit
+        self._clock = clock
+        self._items = {}  # key -> (expiry, value), oldest first
+
+    def _now(self):
+        if self._clock:
+            return self._clock()
+        import time
+        return time.monotonic()
+
+    def _prune(self):
+        now = self._now()
+        for key in list(self._items):
+            if self._items[key][0] > now:
+                break  # (in order of age: the rest is newer)
+            del self._items[key]
+
+    def put(self, key, value):
+        self._prune()
+        self._items.pop(key, None)
+        while len(self._items) >= self.limit:
+            del self._items[next(iter(self._items))]
+        self._items[key] = (self._now() + self.lifetime, value)
+
+    def take(self, key, default=None):
+        """The value remembered for key, which is forgotten with this."""
+        self._prune()
+        found = self._items.pop(key, None)
+        return default if found is None else found[1]
+
+    def __contains__(self, key):
+        self._prune()
+        return key in self._items
+
+    def __len__(self):
+        self._prune()
+        return len(self._items)
+
+
 def mkdirp(path, mode=0o777):
     try:
         os.makedirs(path, mode)
