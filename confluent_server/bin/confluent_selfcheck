@@ -17,6 +17,7 @@ import confluent.certutil as certutil
 import confluent.client as client
 import confluent.config.configmanager as configmanager
 import confluent.netutil as netutil
+import confluent.sandbox as sandbox
 import pwd
 import signal
 import confluent.collective.manager as collective
@@ -31,6 +32,21 @@ def check_sysctl_tuning():
             return
         else:
             emprint('TCP SACK is disabled, network operations to BMCs may be particularly impacted, including firmware updates and virtual media')
+
+
+def check_media_confinement():
+    # (of interest with tenants, which may upload installation media)
+    owner = os.stat('/etc/confluent')
+    user = (owner.st_uid, owner.st_gid) if os.getuid() == 0 and owner.st_uid else None
+    found = sandbox.applied(user=user)
+    problems = sandbox.diagnose(found)
+    if not problems:
+        print('OK ({0})'.format(', '.join(found)))
+        return
+    emprint('Incomplete ({0}); only matters if tenants are used'.format(', '.join(found)))
+    for problem in problems:
+        emprint('  {0}: {1} (Example resolution: {2})'.format(
+            problem['layer'], problem['reason'], problem['fix']))
 
 
 def check_neigh_overflow():
@@ -276,6 +292,8 @@ async def main():
             print('OK')
         fprint('Checking sysctl tunables: ')
         check_sysctl_tuning()
+        fprint('Confinement of programs reading tenant media: ')
+        check_media_confinement()
         fprint('TFTP Status: ')
         if tftp_works():
             print('OK')

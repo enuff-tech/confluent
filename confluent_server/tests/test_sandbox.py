@@ -233,3 +233,185 @@ async def test_media_naming_itself_out_of_its_place_is_refused(workers):
     assert code != 0 or b'ERROR' in out
     assert not (workers / 'distributions' / 'odd' / 'images').exists()
     assert sorted(p.name for p in workers.parent.iterdir()) == ['t00000000000a']
+
+
+# --------------------------------------------- what a worker is started with
+
+CAPS = r'''
+import sys
+for line in open('/proc/self/status'):
+    if line.startswith(('CapEff', 'CapAmb', 'CapPrm', 'CapInh', 'NoNewPrivs')):
+        sys.stdout.write(line)
+'''
+
+
+def test_a_worker_holds_no_capabilities(monkeypatch):
+    # (the service is started with some, which what it runs would inherit;
+    # with only the limits in use, so that /proc can be read to tell)
+    monkeypatch.setattr(sandbox, '_supported', [('limits',)])
+    done = subprocess.run([sys.executable, '-c', CAPS], stdout=subprocess.PIPE,
+                          preexec_fn=sandbox.confiner(), timeout=60)
+    assert done.returncode == 0
+    status = dict(line.split(':\t') for line in done.stdout.decode().splitlines())
+    for name in ('CapEff', 'CapPrm', 'CapAmb'):
+        assert int(status[name], 16) == 0, (name, status)
+    assert status['NoNewPrivs'].strip() == '1'
+
+
+def test_found_out_for_the_user_the_service_runs_as():
+    if os.getuid() != 0:
+        pytest.skip('root asks on behalf of the service user')
+    found = sandbox.applied(user=(65534, 65534))
+    assert found[0] == 'limits' and set(found) <= set(sandbox.LAYERS)
+    assert os.getuid() == 0  # (the one that asked is who it was)
+
+
+# ----------------------------------------------- what a host lacks, and why
+
+def _host(monkeypatch, settings, abi=0):
+    monkeypatch.setattr(sandbox, '_setting', settings.get)
+    monkeypatch.setattr(sandbox, 'landlock_abi', lambda: abi)
+
+
+def test_nothing_is_missing_where_all_of_it_applies(monkeypatch):
+    _host(monkeypatch, {}, abi=4)
+    assert sandbox.diagnose(['limits', 'namespaces', 'landlock']) == []
+
+
+@pytest.mark.parametrize('settings,expected', [
+    ({'/proc/sys/user/max_user_namespaces': '0'}, {'user.max_user_namespaces': '15000'}),
+    ({'/proc/sys/user/max_user_namespaces': '100',
+      '/proc/sys/kernel/unprivileged_userns_clone': '0'},
+     {'kernel.unprivileged_userns_clone': '1'}),
+])
+def test_namespaces_turned_off_by_a_setting(monkeypatch, settings, expected):
+    _host(monkeypatch, settings, abi=4)
+    problem, = sandbox.diagnose(['limits', 'landlock'])
+    assert problem['layer'] == 'namespaces' and problem['sysctl'] == expected
+    assert 'turned off' in problem['reason'] and sandbox.SETUP_HINT in problem['fix']
+
+
+def test_namespaces_kept_by_apparmor_to_profiled_programs(monkeypatch):
+    _host(monkeypatch, {'/proc/sys/user/max_user_namespaces': '100',
+                        '/proc/sys/kernel/unprivileged_userns_clone': '1',
+                        '/proc/sys/kernel/apparmor_restrict_unprivileged_userns': '1'}, abi=4)
+    problem, = sandbox.diagnose(['limits', 'landlock'])
+    assert problem.get('apparmor') is True and 'sysctl' not in problem
+    assert 'restart confluent' in problem['fix']
+
+
+def test_landlock_missing_or_not_active(monkeypatch):
+    _host(monkeypatch, {'/sys/kernel/security/lsm': 'lockdown,capability,yama,apparmor'})
+    problem, = sandbox.diagnose(['limits', 'namespaces'])
+    assert problem['layer'] == 'landlock'
+    assert 'lsm=lockdown,capability,yama,apparmor,landlock' in problem['fix']
+    _host(monkeypatch, {})
+    problem, = sandbox.diagnose(['limits', 'namespaces'])
+    assert 'does not provide Landlock' in problem['reason']
+    # nothing to set for either: a kernel matter
+    assert 'sysctl' not in problem and 'apparmor' not in problem
+    _host(monkeypatch, {}, abi=0)
+    assert [p['layer'] for p in sandbox.diagnose(['limits'])] == ['namespaces', 'landlock']
+
+
+def test_the_host_is_set_up_only_for_what_keeps_it_from_confining(monkeypatch, tmp_path):
+    ran = []
+    monkeypatch.setattr(sandbox, 'SYSCTL_FILE', str(tmp_path / '90-confluent-sandbox.conf'))
+    monkeypatch.setattr(sandbox, 'APPARMOR_PROFILE', str(tmp_path / 'apparmor.d-confluent'))
+    # nothing missing that a setting provides: nothing is written
+    kernel = {'layer': 'landlock', 'reason': 'the kernel does not provide Landlock',
+              'fix': 'needs Linux 5.13 or later'}
+    told = sandbox.enable([kernel], run=lambda cmd: ran.append(cmd) or 0)
+    assert ran == [] and os.listdir(str(tmp_path)) == []
+    assert told == ['landlock: the kernel does not provide Landlock; needs Linux 5.13 or later']
+    # a setting
+    told = sandbox.enable([{'layer': 'namespaces', 'reason': 'r', 'fix': 'f',
+                            'sysctl': {'kernel.unprivileged_userns_clone': '1'}}, kernel],
+                          run=lambda cmd: ran.append(cmd) or 0)
+    written = (tmp_path / '90-confluent-sandbox.conf').read_text()
+    assert 'kernel.unprivileged_userns_clone = 1\n' in written and written.startswith('#')
+    assert ran == [['sysctl', '-q', '-p', sandbox.SYSCTL_FILE]]
+    assert len(told) == 2 and 'kernel.unprivileged_userns_clone = 1' in told[0]
+    # the profile, as packaged
+    del ran[:]
+    told = sandbox.enable([{'layer': 'namespaces', 'reason': 'r', 'fix': 'f', 'apparmor': True}],
+                          run=lambda cmd: ran.append(cmd) or 0)
+    profile = (tmp_path / 'apparmor.d-confluent').read_text()
+    assert 'profile confluent /opt/confluent/bin/confluent flags=(unconfined)' in profile
+    assert 'userns,' in profile
+    assert ran == [['apparmor_parser', '-r', sandbox.APPARMOR_PROFILE]]
+    assert 'restart confluent' in told[0]
+    told = sandbox.enable([{'layer': 'namespaces', 'reason': 'r', 'fix': 'f', 'apparmor': True}],
+                          run=lambda cmd: 1)
+    assert 'did not load' in told[0]
+
+
+def test_the_profile_allows_user_namespaces_and_restricts_nothing():
+    source = [path for path in sandbox.APPARMOR_SOURCES if os.path.exists(path)]
+    assert source, 'the profile is part of the source tree'
+    with open(source[0]) as profile:
+        rules = [line.strip() for line in profile
+                 if line.strip() and not line.strip().startswith('#')]
+    assert rules == ['abi <abi/4.0>,', 'include <tunables/global>',
+                     'profile confluent /opt/confluent/bin/confluent flags=(unconfined) {',
+                     'userns,', 'include if exists <local/confluent>', '}']
+
+
+def test_the_command_tells_what_is_in_effect(monkeypatch):
+    import io
+    import confluent.netnstool as netnstool
+    monkeypatch.setattr(netnstool, 'service_user', lambda: None)
+    monkeypatch.setattr(sandbox, 'applied', lambda user=None: ['limits', 'namespaces', 'landlock'])
+    out = io.StringIO()
+    assert netnstool.sandbox_command(out=out) == 0
+    assert out.getvalue() == 'in effect: limits, namespaces, landlock\n'
+    # something missing: told with what would provide it, changed only on request
+    monkeypatch.setattr(sandbox, 'applied', lambda user=None: ['limits', 'landlock'])
+    _host(monkeypatch, {'/proc/sys/user/max_user_namespaces': '0'}, abi=4)
+    enabled = []
+    monkeypatch.setattr(sandbox, 'enable', lambda problems: enabled.append(problems) or ['done'])
+    out = io.StringIO()
+    assert netnstool.sandbox_command(out=out) == 2
+    assert 'missing: namespaces: user namespaces are turned off' in out.getvalue()
+    assert enabled == []
+    out = io.StringIO()
+    netnstool.sandbox_command(enable=True, out=out)
+    assert len(enabled) == 1 and 'done\n' in out.getvalue() and 'in effect now:' in out.getvalue()
+
+
+# ------------------------------------------------------- required, or not
+
+def test_confinement_is_required_only_when_configured(monkeypatch):
+    import confluent.config.conf as conf
+    for value, expected in ((None, False), ('', False), ('optional', False),
+                            ('required', True), (' Required ', True)):
+        monkeypatch.setattr(conf, 'get_option', lambda section, name, value=value: (
+            value if (section, name) == ('tenants', 'media_sandbox') else None))
+        assert sandbox.required() is expected
+    monkeypatch.setattr(sandbox, '_supported', [('limits', 'namespaces')])
+    assert sandbox.missing() == ['landlock']
+
+
+def test_the_operator_is_told_once_at_start(monkeypatch):
+    import confluent.config.configmanager as configmanager
+    import confluent.main as main
+    logged = []
+    monkeypatch.setattr(main.log, 'service_log', lambda data, **kwargs: logged.append(data))
+    enabled = [False]
+    monkeypatch.setattr(configmanager, 'get_global', lambda name: enabled[0])
+    monkeypatch.setattr(sandbox, '_supported', [('limits', 'namespaces', 'landlock')])
+    main._report_confinement()
+    assert logged == []  # (of no interest without tenants)
+    enabled[0] = True
+    main._report_confinement()
+    assert list(logged[0]) == ['info'] and 'limits, namespaces, landlock' in logged[0]['info']
+    del logged[:]
+    monkeypatch.setattr(sandbox, '_supported', [('limits',)])
+    monkeypatch.setattr(sandbox, 'required', lambda: False)
+    main._report_confinement()
+    assert [list(entry) for entry in logged] == [['warning'], ['warning']]
+    assert 'not confined by namespaces' in logged[0]['warning']
+    del logged[:]
+    monkeypatch.setattr(sandbox, 'required', lambda: True)
+    main._report_confinement()
+    assert len(logged) == 3 and 'cannot import media' in logged[2]['warning']

@@ -57,6 +57,17 @@ mkdir -p /etc/confluent /var/lib/confluent /var/log/confluent /var/cache/conflue
 chown confluent:confluent /etc/confluent /var/lib/confluent /var/log/confluent /var/cache/confluent
 
 sysctl -p /usr/lib/sysctl.d/confluent.conf > /dev/null 2>&1
+# Where AppArmor restricts user namespaces to profiled programs (noble and
+# later), the service gets a profile that allows it them: it confines the
+# programs that read the media of tenants with them. An existing profile
+# (which may have been changed) is left as it is.
+if [ -f /etc/apparmor.d/abi/4.0 ] && [ ! -e /etc/apparmor.d/confluent ] && \
+        [ -f /opt/confluent/share/apparmor/confluent ]; then
+    cp /opt/confluent/share/apparmor/confluent /etc/apparmor.d/confluent
+    if command -v apparmor_parser > /dev/null 2>&1; then
+        apparmor_parser -r /etc/apparmor.d/confluent > /dev/null 2>&1
+    fi
+fi
 NEEDCHOWN=0
 NEEDSTART=0
 [ -n "$(find /etc/confluent /var/log/confluent /var/cache/confluent -uid 0 -print -quit 2>/dev/null)" ] && NEEDCHOWN=1

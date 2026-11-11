@@ -253,9 +253,33 @@ of the service's open files, always; namespaces of their own (no network,
 none of the service's sockets) where unprivileged user namespaces are
 allowed; and Landlock (Linux 5.13 or later), with which a worker can open
 only the interpreter and its libraries, the media, and, to unpack, the
-tenant's distributions. `python3 -c 'import confluent.sandbox as s;
-print(s.applied())'`, run as the service user, tells which of these a host
-provides. Ready-made profile
+tenant's distributions. They hold none of the capabilities the service is
+started with.
+
+Which of these a host provides is told when the service starts (in its
+event log, with what is missing and why, once multi-tenancy is on), by
+`confluent_selfcheck`, and by:
+
+    confluent-netns sandbox            # what is in effect for the service user
+    confluent-netns sandbox --enable   # change the host's settings that prevent it
+
+`--enable` is for the operator to run: it writes
+`/etc/sysctl.d/90-confluent-sandbox.conf` where a kernel setting turns
+user namespaces off, and installs an AppArmor profile for the service
+where AppArmor keeps user namespaces to programs that have one (Ubuntu
+24.04 and later; the Debian package installs that profile itself, and the
+service has to be restarted for it to apply). The profile restricts
+nothing. What only the kernel can provide (Landlock, if it is not among
+the active security modules) is told, with the kernel parameter that
+turns it on, and left to the operator.
+
+To have a tenant's media refused, rather than handled with less, on a
+host without Landlock:
+
+    [tenants]
+    media_sandbox = required
+
+Ready-made profile
 archives are not imported within a tenant, and rebasing only copies from
 the product's packaged profile content. Profiles are not editable through
 the API: customizing one (kernel arguments, scripts) is done in the
