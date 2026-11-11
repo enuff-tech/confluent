@@ -24,6 +24,7 @@ import os
 
 from yarl import URL
 import aiohmi.exceptions as pygexc
+from aiohmi.util import netcontext
 
 
 import aiohttp
@@ -258,7 +259,10 @@ def assign_upload_form(filename, ffilename, data, formname, otherfields, boundar
 
 
 class WebConnection:
-    def __init__(self, host, port, verifycallback=None, timeout=None):
+    def __init__(self, host, port, verifycallback=None, timeout=None, net=None):
+        # The network to connect through (see aiohmi.util.netcontext);
+        # None is the host's own.
+        self.net = netcontext.resolve(net)
         self.port = port
         self.thehost = host
         if ':' in host and '[' not in host:
@@ -293,9 +297,26 @@ class WebConnection:
     def set_header(self, key, value):
         self.stdheaders[key] = value
 
+    def _connector(self):
+        """None (aiohttp's default) on the host network, else a connector
+        whose sockets and name lookups come from the given network."""
+        if self.net is None:
+            return None
+        try:
+            return aiohttp.TCPConnector(socket_factory=self.net.socket_factory,
+                                        resolver=self.net.resolver())
+        except TypeError:
+            raise pygexc.UnsupportedFunctionality(
+                'Connecting through a separate network needs aiohttp 3.12 '
+                'or later')
+
+    def _session(self, *args, **kwargs):
+        return aiohttp.ClientSession(*args, connector=self._connector(), **kwargs)
+
     def dupe(self, timeout=None):
         newwc = WebConnection(self.host, self.port,
-                              verifycallback=self.verifycallback, timeout=timeout or self.timeout)
+                              verifycallback=self.verifycallback, timeout=timeout or self.timeout,
+                              net=self.net)
         newwc.stdheaders = self.stdheaders.copy()
         newwc.cookies = CookieJar(quote_cookie=False, unsafe=True)
         for cookie in self.cookies:
@@ -318,7 +339,7 @@ class WebConnection:
         if referer:
             headers['referer'] = referer
         method = method.lower()
-        async with aiohttp.ClientSession(
+        async with self._session(
                 f'https://{self.host}:{self.port}', cookie_jar=self.cookies, timeout=self.timeout) as session:
             thefunc = getattr(session, method)
             kwargs = {}
@@ -369,7 +390,7 @@ class WebConnection:
         method = method.lower()
         if 'Content-Type' in headers and method.lower() in ('get', 'delete'):
             del headers['Content-Type']
-        async with aiohttp.ClientSession(f'https://{self.host}:{self.port}', cookie_jar=self.cookies, timeout=self.timeout) as session:
+        async with self._session(f'https://{self.host}:{self.port}', cookie_jar=self.cookies, timeout=self.timeout) as session:
             thefunc = getattr(session, method)
             kwargs = {}
             if isinstance(data, dict):
@@ -399,7 +420,7 @@ class WebConnection:
         dlheaders = self.stdheaders.copy()
         if 'Accept-Encoding' in dlheaders:
             del dlheaders['Accept-Encoding']
-        async with aiohttp.ClientSession(f'https://{self.host}:{self.port}', cookie_jar=self.cookies, timeout=self.timeout) as session:
+        async with self._session(f'https://{self.host}:{self.port}', cookie_jar=self.cookies, timeout=self.timeout) as session:
             async with session.get(url, headers=dlheaders, ssl=self.ssl) as rsp:
                 if downloader:
                     downloader.contentlen = rsp.headers.get('content-length', None)
@@ -418,7 +439,7 @@ class WebConnection:
             data = uploader.get_buffer()
         else:
             raise Exception("Not implemented without uploader handler")
-        async with aiohttp.ClientSession(f'https://{self.host}:{self.port}', cookie_jar=self.cookies, timeout=self.timeout) as session:
+        async with self._session(f'https://{self.host}:{self.port}', cookie_jar=self.cookies, timeout=self.timeout) as session:
             async with session.post(url, headers=upheaders, ssl=self.ssl, data=data) as rsp:
                 if rsp.status >= 200 and rsp.status < 300:
                     expect_type = rsp.headers.get('Content-Type', '')

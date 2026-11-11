@@ -23,6 +23,7 @@ import struct
 import asyncio
 import aiohmi.constants as const
 import aiohmi.exceptions as exc
+from aiohmi.util import netcontext
 import aiohmi.ipmi.events as sel
 import aiohmi.ipmi.fru as fru
 import aiohmi.ipmi.oem.generic as genericoem
@@ -151,8 +152,11 @@ class Command(object):
     @classmethod
     async def create(cls, bmc=None, userid=None, password=None, port=623,
                  kg=None, privlevel=None, verifycallback=None,
-                 keepalive=True, **kwargs):
+                 keepalive=True, net=None, **kwargs):
+        """net: the network to reach the BMC through (see
+        aiohmi.ipmi.private.session.Session); None is the host's own."""
         self = cls()
+        self.net = netcontext.resolve(net)
         # TODO(jbjohnso): accept tuples and lists of each parameter for mass
         # operations without pushing the async complexities up the stack
         self.bmc = bmc
@@ -173,7 +177,8 @@ class Command(object):
                                                 port=port,
                                                 kg=kg,
                                                 privlevel=privlevel,
-                                                keepalive=keepalive)
+                                                keepalive=keepalive,
+                                                net=self.net)
             # induce one iteration of the loop, now that we would be
             # prepared for it in theory
             await session.Session.wait_for_rsp(0)

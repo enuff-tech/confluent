@@ -22,161 +22,19 @@ counts every contact, so any fallback to the host network is visible.
 
 import json
 import os
-import shutil
 import socket
 import struct
 import subprocess
 import sys
-import tempfile
-import time
 
 import pytest
 
 import confluent.config.configmanager as configmanager
-import confluent.nsbroker as nsbroker
 import confluent.tenantguard as tenantguard
 import confluent.tenantnet as tenantnet
+from tenanttopo import BROKER_UID, CLIENT, CLIENT_UID, HW_IP, TENANTS, UP_IP, UP_MAC, Topology
 
 pytestmark = pytest.mark.netns
-
-HW_IP = '10.241.34.2'
-UP_IP = '10.241.34.1'
-UP_MAC = '02:00:00:aa:34:01'
-HW_MAC = '02:00:00:aa:34:02'
-TENANTS = {'t00000000000a': ('t1-hw', 61), 't00000000000b': ('t2-hw', 62)}
-BROKER_UID = 65534   # nobody
-CLIENT_UID = 65533   # an unprivileged service account
-
-SERVICE = r'''
-import json, socket, sys, threading, time
-label, countfile, ready = sys.argv[1:4]
-def bump():
-    if countfile != '-':
-        with open(countfile, 'a') as f:
-            f.write('x')
-def tcp():
-    s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    s.bind(('0.0.0.0', 7000)); s.listen(16)
-    open(ready, 'w').close()
-    while True:
-        c, a = s.accept(); bump()
-        c.sendall(json.dumps({'label': label, 'peer': a[0]}).encode() + b'\n'); c.close()
-def udp():
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind(('0.0.0.0', 7001))
-    while True:
-        d, a = s.recvfrom(2048); bump(); s.sendto(json.dumps({'label': label}).encode(), a)
-threading.Thread(target=udp, daemon=True).start()
-tcp()
-'''
-
-CLIENT = r'''
-import array, json, socket, struct, sys
-path = sys.argv[1]
-c = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET); c.connect(path)
-def call(msgid, op, args):
-    c.send(json.dumps({'v': 1, 'id': msgid, 'op': op, 'args': args}).encode())
-    fds = array.array('i')
-    data, anc, _, _ = c.recvmsg(65536, socket.CMSG_SPACE(4))
-    for lvl, typ, cd in anc:
-        fds.frombytes(cd[:len(cd) - len(cd) % 4])
-    return json.loads(data), fds
-call(1, 'hello', {})
-rsp, fds = call(2, 'connect_tcp', {'family': 'inet', 'host': sys.argv[2], 'port': 7000})
-s = socket.socket(fileno=fds[0]); s.setblocking(True)
-caps = [l for l in open('/proc/self/status') if l.startswith('CapEff')][0].split()[1]
-print(json.dumps({'caps': caps, 'uid': __import__('os').getuid(),
-                  'reply': json.loads(s.makefile().readline())}))
-'''
-
-
-class Topology(object):
-    def __init__(self, netns):
-        self.netns = netns
-        self.dir = tempfile.mkdtemp(prefix='cftnet')
-        os.chmod(self.dir, 0o755)
-        self.broker_py = os.path.join(self.dir, 'broker.py')
-        shutil.copy(nsbroker.__file__, self.broker_py)
-        os.chmod(self.broker_py, 0o644)
-        self.ns = {}
-        self.lan = {}
-        self.brokers = {}
-        self.etc = []
-        for tid, (label, ttl) in TENANTS.items():
-            ns, lan = netns.create(), netns.create()
-            netns.veth(ns, 'up0', UP_IP + '/24', lan, 'hw0', HW_IP + '/24',
-                       mac_a=UP_MAC, mac_b=HW_MAC)
-            netns.run(lan, 'sysctl', '-qw', 'net.ipv4.ip_default_ttl=%d' % ttl)
-            self.ns[tid], self.lan[tid] = ns, lan
-            self._service(lan, label, '-')
-            etc = os.path.join('/etc/netns', ns)
-            os.makedirs(etc)
-            self.etc.append(etc)
-            with open(os.path.join(etc, 'hosts'), 'w') as f:
-                f.write('127.0.0.1 localhost\n%s bmc-a\n' % ('10.241.34.2' if label == 't1-hw' else '10.241.34.99'))
-            os.makedirs(os.path.join(self.dir, tid))
-            os.chmod(os.path.join(self.dir, tid), 0o777)
-        self.decoy = netns.create()
-        netns.veth(None, None, UP_IP + '/24', self.decoy, 'hw0', HW_IP + '/24')
-        netns.run(self.decoy, 'sysctl', '-qw', 'net.ipv4.ip_default_ttl=63')
-        self.decoy_count = os.path.join(self.dir, 'decoy.count')
-        open(self.decoy_count, 'w').close()
-        self._service(self.decoy, 'HOST', self.decoy_count)
-        for tid in TENANTS:
-            self.start_broker(tid)
-
-    def _service(self, ns, label, countfile):
-        ready = os.path.join(self.dir, 'ready-' + ns)
-        self.netns.spawn(ns, sys.executable, '-c', SERVICE, label, countfile, ready)
-        self._wait(lambda: os.path.exists(ready))
-
-    @staticmethod
-    def _wait(cond, timeout=10):
-        end = time.time() + timeout
-        while time.time() < end:
-            if cond():
-                return True
-            time.sleep(0.05)
-        raise AssertionError('timed out')
-
-    def socket_path(self, tid):
-        return os.path.join(self.dir, tid, 'broker.sock')
-
-    def start_broker(self, tid, ns=None, uid=BROKER_UID):
-        path = self.socket_path(tid)
-        try:
-            os.unlink(path)
-        except FileNotFoundError:
-            pass
-        caps = '-all,+net_raw,+net_bind_service'
-        proc = self.netns.spawn(
-            ns or self.ns[tid], 'setpriv', '--reuid=%d' % uid, '--regid=%d' % uid,
-            '--clear-groups', '--inh-caps=' + caps, '--ambient-caps=' + caps,
-            '--bounding-set=' + caps, '--no-new-privs', sys.executable, '-I',
-            self.broker_py, '--tenant', tid, '--socket', path,
-            '--allow-uid', '0', '--allow-uid', str(CLIENT_UID))
-        self._wait(lambda: os.path.exists(path))
-        self.brokers[tid] = proc
-        return proc
-
-    def stop_broker(self, tid):
-        proc = self.brokers.pop(tid)
-        proc.kill()
-        proc.wait()
-
-    def network(self, tid, uid=BROKER_UID):
-        return tenantnet.register_network(tid, self.socket_path(tid), uid,
-                                          os.path.join('/run/netns', self.ns[tid]))
-
-    def decoy_hits(self):
-        with open(self.decoy_count) as f:
-            return len(f.read())
-
-    def cleanup(self):
-        for tid in TENANTS:
-            tenantnet.close_tenant(tid)
-        for etc in self.etc:
-            shutil.rmtree(etc, ignore_errors=True)
-        shutil.rmtree(self.dir, ignore_errors=True)
 
 
 @pytest.fixture

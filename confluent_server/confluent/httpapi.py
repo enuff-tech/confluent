@@ -33,7 +33,7 @@ import asyncio
 from aiohttp import web, WSMsgType
 import confluent.apikey as apikey
 import confluent.tenancy as tenancy
-import confluent.tenantguard as tenantguard
+import confluent.tenantnet as tenantnet
 import confluent.auth as auth
 import confluent.config.attributes as attribs
 import confluent.config.configmanager as configmanager
@@ -760,7 +760,7 @@ async def resourcehandler_backend(req, make_response):
     """
     # A connection may carry several requests in one task: start each one
     # outside any tenant until it is authorized.
-    tenantguard.enter(None)
+    tenantnet.enter(None)
     mimetype, extension = _pick_mimetype(req)
 
     reqbody = None
@@ -864,7 +864,7 @@ async def resourcehandler_backend(req, make_response):
     if authorized['code'] == 200 and authorized.get('cfgmgr') is not None:
         # The rest of this request (and anything it starts) is work for
         # this tenant, held to the tenant's network.
-        tenantguard.enter(authorized['cfgmgr'].tenant)
+        tenantnet.enter(authorized['cfgmgr'].tenant)
     if authorized['code'] == 403:
         rsp = await make_response('application/json', 403, 'Forbidden', badauth)
         response = {'result': 'Forbidden'}

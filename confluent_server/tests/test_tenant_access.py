@@ -197,9 +197,17 @@ async def test_enrollment_http_body(mt):
     ('/users/', 'create', True),
     ('/usergroups/ops', 'delete', True),
     (None, 'retrieve', True),
-    ('/nodes/c1/power/state', 'update', False),
+    ('/nodes/c1/power/state', 'update', True),
+    ('/nodes/c1/sensors/hardware/all/all', 'retrieve', True),
+    ('/nodes/c1/configuration/management_controller/users/1', 'update', True),
+    ('/nodes/c1/power/reseat', 'update', False),
+    ('/nodes/c1/power/inlets/1', 'update', False),
+    ('/nodes/c1/inventory/firmware/updates/active', 'create', False),
+    ('/nodes/c1/configuration/management_controller/certificate/sign', 'update', False),
+    ('/nodes/c1/configuration/management_controller/save_licenses', 'update', False),
+    ('/nodes/c1/media/attach', 'update', False),
     ('/nodes/c1/console/session', 'create', False),
-    ('/noderange/c1/power/state', 'update', False),
+    ('/noderange/c1/power/state', 'update', True),
     ('/discovery/rescan', 'update', False),
     ('/networking/macs/rescan', 'update', False),
     ('/deployment/profiles/', 'retrieve', False),
@@ -410,7 +418,7 @@ async def test_http_tenant_login_and_session(http):
     assert http.httpsessions[session]['tenant'] == acme
     reused = await _request(http, 'POST', '/nodes/', session=session)
     assert reused['cfgmgr'].tenant == acme  # not the default tenant's Monitor 'admin'
-    assert (await _request(http, 'POST', '/nodes/c1/power/state', session=session)) == {'code': 403}
+    assert (await _request(http, 'POST', '/nodes/c1/console/session', session=session)) == {'code': 403}
     await configmanager.set_tenant_state(acme, 'disabled')
     assert (await _request(http, 'GET', '/nodes/', session=session))['code'] == 403
 
