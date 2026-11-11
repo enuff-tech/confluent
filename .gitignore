@@ -7,3 +7,4 @@ confluent_client/man/man*
 .idea/*
 confluent_client/doc/man/nodeattrib.ronn
 confluent_client/doc/man/nodegroupattrib.ronn
+.pytest_cache/
