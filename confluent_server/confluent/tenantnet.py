@@ -249,7 +249,20 @@ class Broker(object):
         self.closed = True
         while self._idle:
             self._idle.popleft().close()
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
         for sock in list(self.sockets):
+            if loop is not None and sock.fileno() != -1:
+                # The event loop must forget a socket before it is closed,
+                # or the next socket with the same descriptor inherits its
+                # registration (and is never watched).
+                try:
+                    loop.remove_reader(sock)
+                    loop.remove_writer(sock)
+                except Exception:
+                    pass
             try:
                 sock.close()
             except OSError:
@@ -355,6 +368,9 @@ class TenantNetworkRef(object):
 
     def packet_socket(self, ifname, ethertype, kind='raw'):
         return self._net().packet_socket(ifname, ethertype, kind)
+
+    def listen_tcp(self, port, family='inet', backlog=128):
+        return self._net().listen_tcp(port, family, backlog)
 
     def list_interfaces(self):
         return self._net().list_interfaces()

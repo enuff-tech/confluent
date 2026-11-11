@@ -56,8 +56,9 @@ async def address_is_somewhat_trusted(address, nodename, cfm):
     return False
 
 class CredServer(object):
-    def __init__(self):
-        self.cfm = cfm.ConfigManager(None)
+    def __init__(self, tenant=None):
+        # the tenant whose listener the nodes reach (see tenantservices)
+        self.cfm = cfm.ConfigManager(tenant)
 
     async def handle_client(self, client, peer):
         disarm = None

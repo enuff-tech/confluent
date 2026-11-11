@@ -834,10 +834,17 @@ def _rpc_set_tenant_state(tenantid, state):
 _tenant_state_watchers = []
 
 
-def watch_tenant_state(callback):
+def watch_tenant_state(callback, first=False):
     """Call callback(tenantid, state) on this member whenever a tenant's
-    state changes; state is 'deleted' when it is removed."""
-    _tenant_state_watchers.append(callback)
+    state changes; state is 'deleted' when it is removed.
+
+    Watchers that use a tenant's sockets ask to be called first, so they
+    stop before the tenant's network (itself a watcher) closes them.
+    """
+    if first:
+        _tenant_state_watchers.insert(0, callback)
+    else:
+        _tenant_state_watchers.append(callback)
 
 
 def _notify_tenant_state(tenantid, state):
@@ -876,6 +883,53 @@ async def _rpc_master_set_multitenancy_enabled(enabled):
 
 def _rpc_set_multitenancy_enabled(enabled):
     set_global('multitenancy.enabled', bool(enabled))
+
+
+def get_tenant_ca(tenantid):
+    """A tenant's certificate authority as stored: (certificate PEM,
+    encrypted private key PEM), or None if it has none yet."""
+    if get_tenant(tenantid) is None:
+        raise exc.NotFoundException('No such tenant')
+    stored = _cfgstore['tenant'][tenantid].get('globals', {}).get('tls.ca')
+    if not stored:
+        return None
+    return stored[0], stored[1]
+
+
+async def init_tenant_ca(tenantid, cacert, cakey):
+    """Record a certificate authority for a tenant unless it has one.
+
+    Returns the one in effect, which is the same on every collective
+    member: whichever was recorded first wins.
+    """
+    if get_tenant(tenantid) is None:
+        raise exc.NotFoundException('No such tenant')
+    if cfgleader:
+        return tuple(await exec_on_leader(
+            '_rpc_master_init_tenant_ca', tenantid, cacert, cakey))
+    current = get_tenant_ca(tenantid)
+    if current is not None:
+        return current
+    if cfgstreams:
+        await exec_on_followers('_rpc_set_tenant_ca', tenantid, cacert, cakey)
+    _true_set_tenant_ca(tenantid, cacert, cakey)
+    return cacert, cakey
+
+
+async def _rpc_master_init_tenant_ca(tenantid, cacert, cakey):
+    return await init_tenant_ca(tenantid, cacert, cakey)
+
+
+def _rpc_set_tenant_ca(tenantid, cacert, cakey):
+    _true_set_tenant_ca(tenantid, cacert, cakey)
+
+
+def _true_set_tenant_ca(tenantid, cacert, cakey):
+    if not valid_tenant_id(tenantid) or not is_tenant(tenantid):
+        return
+    _cfgstore['tenant'][tenantid].setdefault('globals', {})['tls.ca'] = [cacert, cakey]
+    _mark_dirtykey('globals', 'tls.ca', tenantid)
+    ConfigManager._bg_sync_to_file()
 
 
 async def set_tenant_enrollment(tenantid, tokenhash, expires):
@@ -2025,6 +2079,16 @@ class ConfigManager(object):
         if not wrapped:
             return None
         return _unwrap_tenant_key(self.tenant, wrapped)
+
+    def derive_secret(self, purpose):
+        """A secret for one purpose (bytes naming it), derived from the
+        key this tenant's secrets are encrypted with."""
+        key = self._cryptkey()
+        if key is None:
+            if _masterkey is None:
+                init_masterkey()
+            key = _masterkey
+        return hmac_mod.new(key, purpose, hashlib.sha256).digest()
 
     def add_client_file(self, clientfile):
         filename = os.path.normpath(clientfile.filename)
