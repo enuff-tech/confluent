@@ -27,9 +27,11 @@ offers and without needing privileges:
   media is unpacked); no TCP, no signals to the service's processes
 - resource limits: CPU time, memory, the size of a file, no core file
 
-Each of these is applied if the host allows it. Without any of them the
-worker is still limited in resources and holds none of the service's open
-files; applied() tells which of them a host provides.
+Each of these is applied if the host allows it; applied() tells which of
+them a host provides. The resource limits alone do not keep a worker from
+the service's data, so whether untrusted data is handled at all on a host
+is a matter of policy (see refusal()): not unless the namespaces or
+Landlock apply, by default.
 """
 
 import ctypes
@@ -347,14 +349,41 @@ def diagnose(found):
     return problems
 
 
-def required():
-    """Whether a tenant's media is only handled fully confined
-    ([tenants] media_sandbox = required in service.cfg)."""
+def policy():
+    """What a tenant's media is handled with ([tenants] media_sandbox in
+    service.cfg):
+
+    'required'  only where Landlock applies
+    'default'   only where Landlock or the namespaces apply (not set)
+    'none'      also with the resource limits alone: the worker can then
+                read what the service can, for a host that provides
+                neither and an operator who accepts that
+    """
     try:
         import confluent.config.conf as conf
-        return (conf.get_option('tenants', 'media_sandbox') or '').strip().lower() == 'required'
+        configured = (conf.get_option('tenants', 'media_sandbox') or '').strip().lower()
     except Exception:
-        return False
+        configured = ''
+    return configured if configured in ('required', 'none') else 'default'
+
+
+def required():
+    """Whether a tenant's media is only handled where Landlock applies."""
+    return policy() == 'required'
+
+
+def refusal(found=None):
+    """Why a tenant's media is not handled on this host, or None if it is."""
+    found = supported() if found is None else found
+    chosen = policy()
+    if chosen == 'none':
+        return None
+    if chosen == 'required' and 'landlock' not in found:
+        return ('this server cannot confine the programs that read it with Landlock, '
+                'which is required here')
+    if 'landlock' not in found and 'namespaces' not in found:
+        return 'this server cannot confine the programs that read it'
+    return None
 
 
 def missing():

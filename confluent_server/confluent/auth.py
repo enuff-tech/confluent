@@ -168,6 +168,8 @@ _tenant_paths = [re.compile(p) for p in (
     r'^/nodes/[^/]+/shell/sessions(/.*)?$',
     # Its own OS images and deployment profiles (its own trees).
     r'^/deployment(/.*)?$',
+    # Whether the deployment of its nodes may be changed (an attribute).
+    r'^/(nodes|noderange)/[^/]+/deployment/lock$',
 )]
 
 

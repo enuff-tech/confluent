@@ -392,6 +392,36 @@ def test_confinement_is_required_only_when_configured(monkeypatch):
     assert sandbox.missing() == ['landlock']
 
 
+def test_untrusted_media_is_not_handled_without_confinement(monkeypatch):
+    import confluent.config.conf as conf
+    configured = [None]
+    monkeypatch.setattr(conf, 'get_option', lambda section, name: (
+        configured[0] if (section, name) == ('tenants', 'media_sandbox') else None))
+    everything = ('limits', 'namespaces', 'landlock')
+    # not set: at least one of the two that keep a worker from the
+    # service's data
+    for value in (None, '', 'optional', 'anything'):
+        configured[0] = value
+        assert sandbox.policy() == 'default'
+        assert sandbox.refusal(everything) is None
+        assert sandbox.refusal(('limits', 'namespaces')) is None
+        assert sandbox.refusal(('limits', 'landlock')) is None
+        assert 'cannot confine' in sandbox.refusal(('limits',))
+        assert 'cannot confine' in sandbox.refusal(())
+    configured[0] = 'required'
+    assert sandbox.refusal(everything) is None
+    assert 'Landlock' in sandbox.refusal(('limits', 'namespaces'))
+    assert sandbox.refusal(('limits',))
+    # the operator's explicit word, for a host that has neither
+    configured[0] = ' None '
+    assert sandbox.policy() == 'none'
+    assert sandbox.refusal(('limits',)) is None
+    # (what this host has, when not told)
+    monkeypatch.setattr(sandbox, '_supported', [('limits',)])
+    configured[0] = None
+    assert sandbox.refusal()
+
+
 def test_the_operator_is_told_once_at_start(monkeypatch):
     import confluent.config.configmanager as configmanager
     import confluent.main as main
@@ -406,12 +436,26 @@ def test_the_operator_is_told_once_at_start(monkeypatch):
     main._report_confinement()
     assert list(logged[0]) == ['info'] and 'limits, namespaces, landlock' in logged[0]['info']
     del logged[:]
-    monkeypatch.setattr(sandbox, '_supported', [('limits',)])
-    monkeypatch.setattr(sandbox, 'required', lambda: False)
+    chosen = ['default']
+    monkeypatch.setattr(sandbox, 'policy', lambda: chosen[0])
+    # one of the two missing: told, and media is still handled
+    monkeypatch.setattr(sandbox, '_supported', [('limits', 'landlock')])
     main._report_confinement()
-    assert [list(entry) for entry in logged] == [['warning'], ['warning']]
+    assert [list(entry) for entry in logged] == [['warning']]
     assert 'not confined by namespaces' in logged[0]['warning']
+    # both missing: tenants cannot import
     del logged[:]
-    monkeypatch.setattr(sandbox, 'required', lambda: True)
+    monkeypatch.setattr(sandbox, '_supported', [('limits',)])
     main._report_confinement()
     assert len(logged) == 3 and 'cannot import media' in logged[2]['warning']
+    # unless the operator said so, which is told as what it means
+    del logged[:]
+    chosen[0] = 'none'
+    main._report_confinement()
+    assert len(logged) == 3 and 'can read all the service can' in logged[2]['warning']
+    # Landlock required and missing
+    del logged[:]
+    chosen[0] = 'required'
+    monkeypatch.setattr(sandbox, '_supported', [('limits', 'namespaces')])
+    main._report_confinement()
+    assert len(logged) == 2 and 'cannot import media' in logged[1]['warning']

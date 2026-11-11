@@ -142,6 +142,11 @@ async def images(confluent_config, monkeypatch, tmp_path):
         {'name': OSNAME, 'method': osimage.EXTRACT, 'category': 'el9'}, None, 'rocky'))
     for tid, name in ((A, 'acme'), (B, 'globex')):
         _create(tid, name)
+    # (the workers are stand-ins here: whatever the host running the tests
+    # provides, they count as confined)
+    import confluent.sandbox as sandbox
+    monkeypatch.setattr(sandbox, '_supported', [('limits', 'namespaces', 'landlock')])
+    monkeypatch.setattr(sandbox, 'policy', lambda: 'default')
     yield {'base': base, 'templates': templates, 'ran': ran, 'identified': identified}
     tenantnet.enter(None)
 
@@ -457,17 +462,32 @@ async def test_media_is_refused_where_confinement_is_required_and_missing(images
     import confluent.sandbox as sandbox
     await tenantsite.ensure(A)
     _write(os.path.join(tenantpaths.media_root(A), 'rocky.iso'), b'x')
-    monkeypatch.setattr(sandbox, 'required', lambda: True)
+    chosen = ['default']
+    monkeypatch.setattr(sandbox, 'policy', lambda: chosen[0])
+
+    async def refused():
+        for path in ('/deployment/importing/', '/deployment/fingerprint/'):
+            with pytest.raises(exc.NotImplementedException, match='cannot confine'):
+                await _as(A, path, 'create', {'filename': 'rocky.iso'})
+        # the media was not looked at, by anything
+        assert images['identified'] == [] and images['ran'] == []
+    # a host with the resource limits only: such a worker could read all
+    # the service can, so a tenant's media is not handed to one
+    monkeypatch.setattr(sandbox, '_supported', [('limits',)])
+    await refused()
+    # Landlock required, and only the namespaces there
+    chosen[0] = 'required'
     monkeypatch.setattr(sandbox, '_supported', [('limits', 'namespaces')])
-    for path in ('/deployment/importing/', '/deployment/fingerprint/'):
-        with pytest.raises(exc.NotImplementedException, match='cannot confine'):
-            await _as(A, path, 'create', {'filename': 'rocky.iso'})
-    # the media was not looked at, by anything
-    assert images['identified'] == [] and images['ran'] == []
-    # not required: handled with what the host has
-    monkeypatch.setattr(sandbox, 'required', lambda: False)
+    await refused()
+    # either of the two is enough otherwise
+    chosen[0] = 'default'
     await _import(A)
     # required and there: handled
-    monkeypatch.setattr(sandbox, 'required', lambda: True)
+    chosen[0] = 'required'
     monkeypatch.setattr(sandbox, '_supported', [('limits', 'landlock')])
     await _import(B)
+    # and with nothing, only on the operator's word
+    chosen[0] = 'none'
+    monkeypatch.setattr(sandbox, '_supported', [('limits',)])
+    key = await _import(A, name='again.iso', custname='second')
+    assert key == 'second'

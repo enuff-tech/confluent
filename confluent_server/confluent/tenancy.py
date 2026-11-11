@@ -53,12 +53,14 @@ def _lookup(name_or_id):
 
 
 def _has_administrator(tenantid):
+    # (as authorization sees it: a user or group without a role is an
+    # administrator)
     cfm = configmanager.ConfigManager(tenantid)
     for user in cfm.list_users():
-        if (cfm.get_user(user) or {}).get('role') == 'Administrator':
+        if (cfm.get_user(user) or {}).get('role', 'Administrator') == 'Administrator':
             return True
     for group in cfm.list_usergroups():
-        if (cfm.get_usergroup(group) or {}).get('role') == 'Administrator':
+        if (cfm.get_usergroup(group) or {}).get('role', 'Administrator') == 'Administrator':
             return True
     return False
 

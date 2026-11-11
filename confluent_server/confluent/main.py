@@ -224,14 +224,16 @@ def _report_confinement():
         log.service_log({'info': 'Programs reading the media of tenants are confined '
                                  '({0})'.format(', '.join(found))})
         return
-    strict = sandbox.required() and 'landlock' not in found
     for problem in problems:
         log.service_log({'warning': 'Programs reading the media of tenants are not confined '
                                     'by {0}: {1} ({2})'.format(
                                         problem['layer'], problem['reason'], problem['fix'])})
-    if strict:
-        log.service_log({'warning': 'Tenants cannot import media on this server '
-                                    '(media_sandbox = required)'})
+    refused = sandbox.refusal(found)
+    if refused:
+        log.service_log({'warning': 'Tenants cannot import media: ' + refused})
+    elif 'landlock' not in found and 'namespaces' not in found:
+        log.service_log({'warning': 'Programs reading the media of tenants can read all the '
+                                    'service can (media_sandbox = none)'})
 
 
 def _finish_shutdown():
