@@ -152,6 +152,9 @@ _tenant_paths = [re.compile(p) for p in (
     r'^/(nodes|noderange)/[^/]+/configuration/management_controller/'
     r'(users|net_interfaces|reset|hostname|identifier|domain_name|location|'
     r'ntp|extended|alerts)(/.*)?$',
+    # The tenant's own discovery: what it has detected, manual
+    # registration, rescan and autosense (all kept per tenant).
+    r'^/discovery(/.*)?$',
 )]
 
 

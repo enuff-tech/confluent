@@ -478,6 +478,9 @@ switchbackoff = 30
 
 
 async def find_nodeinfo_by_mac(mac, configmanager):
+    if configmanager.tenant is not None:
+        # The switch map below is the host's; tenants have none yet.
+        return None, {'maccount': 0}
     now = util.monotonic_time()
     if vintage and (now - vintage) < 90 and mac in _nodesbymac:
         return _nodesbymac[mac][0], {'maccount': _nodesbymac[mac][1]}
@@ -649,6 +652,8 @@ async def handle_api_request(configmanager, inputdata, operation, pathcomponents
 
 
 async def get_node_fingerprints(nodename, configmanager):
+    if configmanager.tenant is not None:
+        return  # switch-based identification is the host's; tenants have none yet
     cfg = configmanager.get_node_attributes(nodename, ['net*.switch',
                                                        'net*.switchport'])
     for attrkey in cfg[nodename]:

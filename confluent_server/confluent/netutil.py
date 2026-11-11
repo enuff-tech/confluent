@@ -58,7 +58,68 @@ niclist = []
 niclistexpiry = 0
 
 
+def _tenantnet():
+    # imported on first use, as configmanager imports this module
+    import confluent.tenantnet as tenantnet
+    return tenantnet
+
+
+# Within a tenant, addresses, interfaces and names are those of the
+# tenant's network namespace, learned through its broker; the host's
+# (/sys, netlink, psutil, the host resolver) are never consulted.
+
+async def _getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+    """loop.getaddrinfo, answered within the current tenant's network."""
+    net = _tenantnet().current_network()
+    if net is None:
+        return await asyncio.get_running_loop().getaddrinfo(
+            host, port, family=family, type=type, proto=proto, flags=flags)
+    if isinstance(host, bytes):
+        host = host.decode()
+    found = []
+    for fam, sockaddr in await net.getaddrinfo(host, port or 0):
+        if family and fam != family:
+            continue
+        found.append((fam, type or socket.SOCK_STREAM, proto, '', sockaddr))
+    if not found:
+        raise socket.gaierror(socket.EAI_NONAME, 'cannot resolve {0}'.format(host))
+    return found
+
+
+def _is_global(fam, addr):
+    # what netlink reports as scope global: not loopback, not link-local
+    if fam == socket.AF_INET:
+        return addr[0] != 127
+    return addr != socket.inet_pton(socket.AF_INET6, '::1') and \
+        not (addr[0] == 0xfe and addr[1] & 0xc0 == 0x80)
+
+
+async def _tenant_addresses(net, idx=0, family=0, matchlla=None):
+    interfaces = await net.alist_interfaces()
+    if matchlla:
+        for iface in interfaces:
+            for addr in iface.get('ipv6', []):
+                addr = addr.split('/')[0]
+                if socket.inet_pton(socket.AF_INET6, addr) == matchlla:
+                    return await _tenant_addresses(net, idx=iface['index'])
+        return []
+    addrs = []
+    for iface in interfaces:
+        if idx and iface['index'] != idx:
+            continue
+        for fam, key in ((socket.AF_INET, 'ipv4'), (socket.AF_INET6, 'ipv6')):
+            if family and fam != family:
+                continue
+            for addr in iface.get(key, []):
+                addr, plen = addr.split('/')
+                addr = socket.inet_pton(fam, addr)
+                if _is_global(fam, addr):
+                    addrs.append((fam, addr, int(plen), iface['index']))
+    return addrs
+
+
 def list_viable_nics():
+    _tenantnet().refuse_for_tenant('Listing network interfaces')
     global niclist
     global niclistexpiry
     if niclist and niclistexpiry > time.time():
@@ -85,6 +146,16 @@ def list_viable_nics():
 
 async def peer_reachable(address):
     checkports = 22, 443
+    if _tenantnet().current_network() is not None:
+        reachable_ports = []
+        for port in checkports:
+            try:
+                sock = await _tenantnet().aconnect(address, port, timeout=0.5)
+            except Exception:
+                continue
+            sock.close()
+            reachable_ports.append(port)
+        return reachable_ports
     testtasks = []
     for port in checkports:
         async def check_port(port):
@@ -141,11 +212,15 @@ def mac2lla(mac):
     return lla
 
 async def my_ip_facing(target):
-    addrinfo = await asyncio.get_running_loop().getaddrinfo(
-                            target, 0, type=socket.SOCK_DGRAM)
+    addrinfo = await _getaddrinfo(target, 0, type=socket.SOCK_DGRAM)
     family, socktype, proto, _, destination = addrinfo[0]
     myip = None
-    with socket.socket(family, socktype, proto) as sock:
+    net = _tenantnet().current_network()
+    if net is not None:
+        sock = net.udp_socket(family)
+    else:
+        sock = socket.socket(family, socktype, proto)
+    with sock:
         # UDP connect selects the route and local address without
         # transmitting a packet.
         sock.connect(destination)
@@ -153,6 +228,7 @@ async def my_ip_facing(target):
     return myip
 
 async def mac2ip(mac):
+    _tenantnet().refuse_for_tenant('Looking up neighbors')
     lla = None
     ipaddr = None
     try:
@@ -192,6 +268,7 @@ async def ping_everywhere():
     return pingresponders
 
 async def ping6(target, interface=None, multi=False):
+    _tenantnet().refuse_for_tenant('IPv6 ping')
     # Do an IPv6 ping.  Notably interesting target is ff02::1, to induce all local
     # peers to transmit a reply
     respondingpeers = set([])
@@ -285,13 +362,13 @@ async def ip_on_same_subnet(first, second, prefix):
         first = first.replace('::ffff:', '')
     if second.startswith('::ffff:') and '.' in second:
         second = second.replace('::ffff:', '')
-    addrinf = (await asyncio.get_running_loop().getaddrinfo(first, 0, type=socket.SOCK_STREAM))[0]
+    addrinf = (await _getaddrinfo(first, 0, type=socket.SOCK_STREAM))[0]
     fam = addrinf[0]
     if '%' in addrinf[-1][0]:
         return False
     ip = socket.inet_pton(fam, addrinf[-1][0])
     ip = int(codecs.encode(bytes(ip), 'hex'), 16)
-    addrinf = (await asyncio.get_running_loop().getaddrinfo(second, 0, type=socket.SOCK_STREAM))[0]
+    addrinf = (await _getaddrinfo(second, 0, type=socket.SOCK_STREAM))[0]
     if fam != addrinf[0]:
         return False
     txtaddr = addrinf[-1][0].split('%')[0]
@@ -308,9 +385,21 @@ async def ip_on_same_subnet(first, second, prefix):
 
 
 async def ipn_is_local(ipn):
+    net = _tenantnet().current_network()
+    if net is not None:
+        for fam, addr, plen, _ in await _tenant_addresses(net):
+            if len(addr) == len(ipn) and ipn_on_same_subnet(fam, addr, ipn, plen):
+                return True
+        return False
     return await neighutil.ipn_is_local(ipn)
 
 async def address_is_local(address):
+    net = _tenantnet().current_network()
+    if net is not None:
+        for fam, addr, plen, _ in await _tenant_addresses(net):
+            if await ip_on_same_subnet(socket.inet_ntop(fam, addr), address, plen):
+                return True
+        return False
     if psutil:
         ifas = psutil.net_if_addrs()
         for iface in ifas:
@@ -345,6 +434,7 @@ def _rebuildidxmap():
 
 
 async def myiptonets(svrip):
+    _tenantnet().refuse_for_tenant('Listing network interfaces')
     fam = socket.AF_INET
     if ':' in svrip:
         fam = socket.AF_INET6
@@ -384,6 +474,7 @@ def _iftonets(ifidx):
     return inametonets(ifidx)
 
 def inametonets(iname):
+    _tenantnet().refuse_for_tenant('Listing network interfaces')
     addrs = []
     if psutil:
         ifaces = psutil.net_if_addrs()
@@ -473,7 +564,7 @@ class NetManager(object):
             if ipv4addr:
                 try:
                     luaddr = ipv4addr.split('/', 1)[0]
-                    for ai in await asyncio.get_running_loop().getaddrinfo(luaddr, 0, family=socket.AF_INET, type=socket.SOCK_STREAM):
+                    for ai in await _getaddrinfo(luaddr, 0, family=socket.AF_INET, type=socket.SOCK_STREAM):
                         ipv4addr.replace(luaddr, ai[-1][0])
                 except socket.gaierror:
                     pass
@@ -483,7 +574,7 @@ class NetManager(object):
                 currname = attribs.get('hostname', self.node).split()[0]
                 if currname and currname not in self.consumednames4:
                     try:
-                        for ai in await asyncio.get_running_loop().getaddrinfo(currname, 0, family=socket.AF_INET, type=socket.SOCK_STREAM):
+                        for ai in await _getaddrinfo(currname, 0, family=socket.AF_INET, type=socket.SOCK_STREAM):
                             if ai[-1][0] not in self.consumedaddrs:
                                 ipv4addr = ai[-1][0]
                                 self.consumednames4.add(currname)
@@ -503,7 +594,7 @@ class NetManager(object):
             ipv6addr = attribs.get('ipv6_address', None)
             if ipv6addr:
                 try:
-                    for ai in await asyncio.get_running_loop().getaddrinfo(ipv6addr, 0, family=socket.AF_INET6, type=socket.SOCK_STREAM):
+                    for ai in await _getaddrinfo(ipv6addr, 0, family=socket.AF_INET6, type=socket.SOCK_STREAM):
                         ipv6addr = ai[-1][0]
                 except socket.gaierror:
                     pass
@@ -513,7 +604,7 @@ class NetManager(object):
                 currname = attribs.get('hostname', self.node).split()[0]
                 if currname and currname not in self.consumednames6:
                     try:
-                        for ai in await asyncio.get_running_loop().getaddrinfo(currname, 0, family=socket.AF_INET6, type=socket.SOCK_STREAM):
+                        for ai in await _getaddrinfo(currname, 0, family=socket.AF_INET6, type=socket.SOCK_STREAM):
                             if ai[-1][0] not in self.consumedaddrs:
                                 ipv6addr = ai[-1][0]
                                 self.consumednames6.add(currname)
@@ -601,11 +692,11 @@ async def get_full_net_config(configmanager, node, serverip=None):
     bmc6 = None
     if bmc:
         try:
-            bmc4 = (await asyncio.get_running_loop().getaddrinfo(bmc, 0, family=socket.AF_INET, type=socket.SOCK_DGRAM))[0][-1][0]
+            bmc4 = (await _getaddrinfo(bmc, 0, family=socket.AF_INET, type=socket.SOCK_DGRAM))[0][-1][0]
         except Exception:
             pass
         try:
-            bmc6 = (await asyncio.get_running_loop().getaddrinfo(bmc, 0, family=socket.AF_INET6, type=socket.SOCK_DGRAM))[0][-1][0]
+            bmc6 = (await _getaddrinfo(bmc, 0, family=socket.AF_INET6, type=socket.SOCK_DGRAM))[0][-1][0]
         except Exception:
             pass
     attribs = {}
@@ -761,12 +852,12 @@ async def get_nic_config(configmanager, node, ip=None, mac=None, ifidx=None,
     if bmc:
         try:
             if onlyfamily in (0, socket.AF_INET):
-                bmc4 = (await asyncio.get_running_loop().getaddrinfo(bmc, 0, family=socket.AF_INET, type=socket.SOCK_DGRAM))[0][-1][0]
+                bmc4 = (await _getaddrinfo(bmc, 0, family=socket.AF_INET, type=socket.SOCK_DGRAM))[0][-1][0]
         except Exception:
             pass
         try:
             if onlyfamily in (0, socket.AF_INET6):
-                bmc6 = (await asyncio.get_running_loop().getaddrinfo(bmc, 0, family=socket.AF_INET6, type=socket.SOCK_DGRAM))[0][-1][0]
+                bmc6 = (await _getaddrinfo(bmc, 0, family=socket.AF_INET6, type=socket.SOCK_DGRAM))[0][-1][0]
         except Exception:
             pass
     cfgbyname = {}
@@ -827,13 +918,13 @@ async def get_nic_config(configmanager, node, ip=None, mac=None, ifidx=None,
     ip6bynodename = None
     try:
         if onlyfamily in (socket.AF_INET, 0):
-            for addr in await asyncio.get_running_loop().getaddrinfo(node, 0, family=socket.AF_INET, type=socket.SOCK_DGRAM):
+            for addr in await _getaddrinfo(node, 0, family=socket.AF_INET, type=socket.SOCK_DGRAM):
                 ipbynodename = addr[-1][0]
     except socket.gaierror:
         pass
     try:
         if onlyfamily in (socket.AF_INET6, 0):
-            for addr in await asyncio.get_running_loop().getaddrinfo(node, 0, family=socket.AF_INET6, type=socket.SOCK_DGRAM):
+            for addr in await _getaddrinfo(node, 0, family=socket.AF_INET6, type=socket.SOCK_DGRAM):
                     ip6bynodename = addr[-1][0]
     except socket.gaierror:
         pass
@@ -883,7 +974,7 @@ async def get_nic_config(configmanager, node, ip=None, mac=None, ifidx=None,
                     if bmc6 and candip == bmc6:
                         continue
                     try:
-                        for inf in await asyncio.get_running_loop().getaddrinfo(candip, 0, family=fam, type=socket.SOCK_STREAM):
+                        for inf in await _getaddrinfo(candip, 0, family=fam, type=socket.SOCK_STREAM):
                             candipn = socket.inet_pton(fam, inf[-1][0])
                         if ((isremote and ipn_on_same_subnet(fam, clientipn, candipn, int(candprefix)))
                                 or ipn_on_same_subnet(fam, bootsvrip, candipn, prefix)):
@@ -903,7 +994,7 @@ async def get_nic_config(configmanager, node, ip=None, mac=None, ifidx=None,
                     except Exception as e:
                         cfgdata['error_msg'] = "Error trying to evaluate net.*ipv4_address attribute value '{0}' on {1}: {2}".format(candip, node, str(e))
                 elif candgw:
-                    for inf in await asyncio.get_running_loop().getaddrinfo(candgw, 0, family=fam, type=socket.SOCK_STREAM):
+                    for inf in await _getaddrinfo(candgw, 0, family=fam, type=socket.SOCK_STREAM):
                         candgwn = socket.inet_pton(fam, inf[-1][0])
                     if ipn_on_same_subnet(fam, bootsvrip, candgwn, prefix):
                         candgws.append((fam, candgwn, prefix))
@@ -981,7 +1072,7 @@ async def get_nic_config(configmanager, node, ip=None, mac=None, ifidx=None,
                 if gw is None or not gw:
                     continue
                 gwn = socket.inet_pton(fam, gw)
-                ip = (await asyncio.get_running_loop().getaddrinfo(ip, 0, proto=socket.IPPROTO_TCP, family=fam))[-1][-1][0]
+                ip = (await _getaddrinfo(ip, 0, proto=socket.IPPROTO_TCP, family=fam))[-1][-1][0]
                 ipn = socket.inet_pton(fam, ip)
                 if ipn_on_same_subnet(fam, ipn, gwn, prefix):
                     cfgdata['ipv{}_gateway'.format(nver)] = gw
@@ -1006,6 +1097,9 @@ nlhdrsz = struct.calcsize('IHHII')
 ifaddrsz = struct.calcsize('BBBBI')
 
 async def get_my_addresses(idx=0, family=0, matchlla=None):
+    net = _tenantnet().current_network()
+    if net is not None:
+        return await _tenant_addresses(net, idx=idx, family=family, matchlla=matchlla)
     return await neighutil.get_my_addresses(idx=idx, family=family, matchlla=matchlla)
 
 
@@ -1016,7 +1110,7 @@ async def get_prefix_len_for_ip(ip):
         plen = int(plen)
     myaddrs = await get_my_addresses()
     found = False
-    for inf in await asyncio.get_running_loop().getaddrinfo(ip, 0, type=socket.SOCK_DGRAM):
+    for inf in await _getaddrinfo(ip, 0, type=socket.SOCK_DGRAM):
         if plen:
             yield (inf[0], plen)
             return
@@ -1042,12 +1136,12 @@ async def addresses_match(addr1, addr2):
     """
     if '%' in addr1 or '%' in addr2:
         return False
-    for addrinfo in await asyncio.get_running_loop().getaddrinfo(addr1, 0, type=socket.SOCK_STREAM):
+    for addrinfo in await _getaddrinfo(addr1, 0, type=socket.SOCK_STREAM):
         rootaddr1 = socket.inet_pton(addrinfo[0], addrinfo[4][0])
         if addrinfo[0] == socket.AF_INET6 and rootaddr1[:12] == b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff':
             # normalize to standard IPv4
             rootaddr1 = rootaddr1[-4:]
-        for otherinfo in await asyncio.get_running_loop().getaddrinfo(addr2, 0, type=socket.SOCK_STREAM):
+        for otherinfo in await _getaddrinfo(addr2, 0, type=socket.SOCK_STREAM):
             otheraddr = socket.inet_pton(otherinfo[0], otherinfo[4][0])
             if otherinfo[0] == socket.AF_INET6 and otheraddr[:12] == b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff':
                 otheraddr = otheraddr[-4:]
