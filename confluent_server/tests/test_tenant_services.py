@@ -202,8 +202,8 @@ async def test_only_node_paths_are_served(listeners):
                  '/sessions/current/info', '/tenants/', '/selfish'):
         rsp = await listeners[A].get(path, headers=_headers(A))
         assert rsp.status == 404, path
-    # SSH certificates and remote configuration are not served yet
-    for path in ('/self/sshcert', '/self/remoteconfig/post', '/self/remotesyncfiles',
+    # remote configuration is not served yet
+    for path in ('/self/remoteconfig/post', '/self/remotesyncfiles',
                  '/self/remoteconfigbmc', '/self/register_discovered'):
         rsp = await listeners[A].post('/confluent-api' + path, headers=_headers(A), data=b'x')
         assert rsp.status == 501, path
@@ -211,6 +211,47 @@ async def test_only_node_paths_are_served(listeners):
         rsp = await listeners[A].post('/confluent-api' + path, data=b'x',
                                       headers={'CONFLUENT_NODENAME': 'n1'})
         assert rsp.status == 401, path
+
+
+async def test_ssh_host_keys_are_signed_by_the_tenants_authority(listeners, monkeypatch):
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import ed25519
+    import confluent.tenantssh as tenantssh
+    if not tenantssh.available():
+        pytest.skip('cryptography without SSH certificates')
+    openssh = (serialization.Encoding.OpenSSH, serialization.PublicFormat.OpenSSH)
+    hostkey = ed25519.Ed25519PrivateKey.generate().public_key().public_bytes(*openssh)
+    import confluent.selfservice as selfservice
+
+    async def names(nodename, cfg, myip=None, **kwargs):
+        # (what else the node is known as: found on the tenant's network,
+        # which these loopback listeners do not have)
+        return set([nodename + '.' + cfg.tenant + '.example'])
+    monkeypatch.setattr(selfservice, 'get_extra_names', names)
+    signers = {}
+    for tid in (A, B):
+        rsp = await listeners[tid].post('/confluent-api/self/sshcertready', headers=_headers(tid))
+        assert rsp.status == 200
+        rsp = await listeners[tid].post('/confluent-api/self/sshcert', headers=_headers(tid),
+                                        data=hostkey + b' root@n1\n')
+        assert rsp.status == 200, await rsp.text()
+        cert = serialization.load_ssh_public_identity((await rsp.text()).encode())
+        cert.verify_cert_signature()
+        assert cert.type == serialization.SSHCertificateType.HOST
+        assert cert.key_id == b'n1'
+        assert cert.valid_principals == [b'n1', ('n1.' + tid + '.example').encode()]
+        assert cert.public_key().public_bytes(*openssh) == hostkey
+        signers[tid] = cert.signature_key().public_bytes(*openssh)
+        assert tenantssh.ca_public(tid).startswith(signers[tid] + b' ')
+    assert signers[A] != signers[B]
+    # not for another tenant's node, not for what is no key
+    rsp = await listeners[A].post('/confluent-api/self/sshcert', headers=_headers(B), data=hostkey)
+    assert rsp.status == 401
+    rsp = await listeners[A].post('/confluent-api/self/sshcert', headers=_headers(A),
+                                  data=b'not a key')
+    assert rsp.status == 400
+    # (the authority of the installation and its agent are not involved)
+    assert selfservice.inflight_sshcerts == {}
 
 
 async def test_addresses_are_the_connections_not_the_headers(listeners):
