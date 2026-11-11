@@ -30,6 +30,7 @@ import hashlib
 import msgpack
 import os
 import pwd
+import re
 import confluent.tasks as tasks
 import confluent.userutil as userutil
 import confluent.util as util
@@ -100,6 +101,16 @@ _allowedbyrole = {
     }
 }
 
+_allowedbyrole[configmanager.PLATFORM_ROLE] = {
+    # Tenant lifecycle and service settings only: no infrastructure, not even
+    # that of the default tenant.
+    'retrieve': ['/', '/tenants*', '/platform/*', '/version'],
+    'create': ['/tenants*'],
+    'update': ['/tenants*', '/platform/*'],
+    'delete': ['/tenants*'],
+    'start': ['/sessions/current/async'],
+}
+
 _deniedbyrole = {
     # This supersedes the above and is only consulted after the allowed has happened
     'Operator': {
@@ -108,6 +119,58 @@ _deniedbyrole = {
         ]
     }
 }
+
+# What a principal of a tenant may reach. Until a subsystem acts within the
+# tenant's own networks, it is not listed here, and requests to it are
+# refused rather than served from the host's network (fail closed).
+_tenant_paths = [re.compile(p) for p in (
+    r'^/$',
+    r'^/version$',
+    r'^/nodes/?$',
+    r'^/nodes/[^/]+/?$',
+    r'^/nodes/[^/]+/attributes(/.*)?$',
+    r'^/nodegroups/?$',
+    r'^/nodegroups/[^/]+/?$',
+    r'^/nodegroups/[^/]+/attributes(/.*)?$',
+    r'^/noderange/?$',
+    r'^/noderange/[^/]+/?$',
+    r'^/noderange/[^/]+/nodes/?$',
+    r'^/noderange/[^/]+/attributes(/.*)?$',
+    r'^/users(/.*)?$',
+    r'^/usergroups(/.*)?$',
+)]
+
+
+def _tenant_path_allowed(element):
+    if not element:  # /sessions/current/... carries no element
+        return True
+    for suffix in ('.json', '.html'):
+        if element.endswith(suffix):
+            element = element[:-len(suffix)]
+    return any(p.match(element) for p in _tenant_paths)
+
+
+def _platform_path(element):
+    return bool(element) and (element.startswith('/tenants') or
+                              element.startswith('/platform'))
+
+
+def _resolve_tenant(tenant):
+    """A tenant given by name or id, as its id; unknown names unchanged
+    (they then fail every check, as no store has that key)."""
+    if configmanager.valid_tenant_id(tenant) and configmanager.get_tenant(tenant):
+        return tenant
+    return configmanager.find_tenant(tenant) or tenant
+
+
+def tenant_usable(tenant):
+    """Whether principals of a tenant may act at all."""
+    if tenant is None:
+        return True
+    if not configmanager.multitenancy_enabled():
+        return False
+    record = configmanager.get_tenant(tenant)
+    return record is not None and record['state'] == 'active'
 
 
 class PromptsNeeded(Exception):
@@ -159,12 +222,10 @@ def _get_usertenant(name, tenant=False):
     """_get_usertenant
 
     Convenience function to parse name into username and tenant.
-    If tenant is explicitly passed in, then name must be the username
-    tenant name with '/' is forbidden.  If '/' is seen in name, tenant
-    is assumed to preface the /.
-    If the username is a tenant name, then it is to be the implied
-    administrator account a tenant gets.
-    Otherwise, just assume a user in the default tenant
+    If tenant is explicitly passed in (None for the default tenant, else a
+    tenant id), then name must be the username.  If '/' is seen in name,
+    the tenant name or id is assumed to preface the /, and is returned as
+    the tenant's id.  Otherwise, just assume a user in the default tenant.
     """
     if not isinstance(name, bytes):
         name = name.encode('utf-8')
@@ -173,10 +234,7 @@ def _get_usertenant(name, tenant=False):
         user = name
     elif b'/' in name:  # tenant scoped name
         tenant, user = name.split(b'/', 1)
-    elif configmanager.is_tenant(name):
-        # the account is the implicit tenant owner account
-        user = name
-        tenant = name
+        tenant = _resolve_tenant(util.stringify(tenant))
     else:  # assume it is a non-tenant user account
         user = name
         tenant = None
@@ -207,10 +265,18 @@ def authorize(name, element, tenant=False, operation='create',
     # even if pam does authentication.
     if operation not in ('create', 'start', 'update', 'retrieve', 'delete', None):
         return False
-    if operation != 'retrieve' and element and (element.startswith('/users') or element.startswith('/usergroups')):
-        return False
+    usermgmt = (operation != 'retrieve' and element and
+                (element.startswith('/users') or element.startswith('/usergroups')))
     user, tenant = _get_usertenant(name, tenant)
-    if tenant is not None and not configmanager.is_tenant(tenant):
+    if tenant is not None:
+        # A tenant's principals act only inside an active tenant of a
+        # multi-tenant service, and only on what is tenant-aware.
+        if not configmanager.is_tenant(tenant) or not tenant_usable(tenant):
+            return False
+        if not _tenant_path_allowed(element) or _platform_path(element):
+            return False
+    elif usermgmt:
+        # Users of the main store are managed locally (UNIX socket) only.
         return False
     manager = configmanager.ConfigManager(tenant, username=user)
     userobj = manager.get_user(user)
@@ -223,13 +289,23 @@ def authorize(name, element, tenant=False, operation='create',
         return userobj, manager, user, tenant, skipuserobj
     if userobj and userobj.get('role', None) == 'Stub':
         userobj = None
-    if not userobj:
-        for group in userutil.grouplist(user):
-            userobj = manager.get_usergroup(group)
-            if userobj:
-                break
+    if not userobj and tenant is None:
+        # Host OS group membership only ever maps to the main store; a
+        # tenant's usergroups are not tied to accounts of the host.
+        try:
+            for group in userutil.grouplist(user):
+                userobj = manager.get_usergroup(group)
+                if userobj:
+                    break
+        except KeyError:  # no such OS account
+            userobj = None
     if userobj:  # returning
         role = userobj.get('role', 'Administrator')
+        if _platform_path(element) and role != configmanager.PLATFORM_ROLE:
+            # Tenant lifecycle belongs to platform administrators only.
+            return False
+        if usermgmt and role != 'Administrator':
+            return False
         if element and role != 'Administrator':
             for rule in _allowedbyrole.get(role, {}).get(operation, []):
                 if fnmatch(element, rule):
@@ -268,6 +344,10 @@ async def check_user_passphrase(name, passphrase, operation=None, element=None, 
     # for that particular user.
     # similarly, guessing usernames is throttled to 20/sec
     user, tenant = _get_usertenant(name, tenant)
+    if tenant is not None and not (configmanager.is_tenant(tenant) and
+                                   tenant_usable(tenant)):
+        await asyncio.sleep(0.05)  # same delay as an unknown user
+        return None
     while (user, tenant) in _passchecking:
         # Want to serialize passphrase checking activity
         # by a user, which might be malicious
@@ -276,7 +356,7 @@ async def check_user_passphrase(name, passphrase, operation=None, element=None, 
         await asyncio.sleep(0.5)
     cfm = configmanager.ConfigManager(tenant, username=user)
     ucfg = cfm.get_user(user)
-    if ucfg is None:
+    if ucfg is None and tenant is None:
         try:
             for group in userutil.grouplist(user):
                 ucfg = cfm.get_usergroup(group)
@@ -325,7 +405,9 @@ async def check_user_passphrase(name, passphrase, operation=None, element=None, 
         if crypt == crypted:
             _passcache[(user, tenant)] = hashlib.sha256(bpassphrase).digest()
             return authorize(user, element, tenant, operation)
-    if pam:
+    if pam and tenant is None:
+        # Host accounts (PAM) authenticate users of the main store only;
+        # a tenant's users exist only in the tenant.
         pwe = None
         try:
             pwe = pwd.getpwnam(user)

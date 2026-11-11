@@ -73,7 +73,7 @@ async def test_create_and_validate_v2_key(cfm):
     assert payload['sub'] == 'alice' and payload['exp'] == data['expires']
     assert 29 * 86400 < data['expires'] - time.time() <= 30 * 86400
     info = apikey.validate_bearer(data['token'], cfm)
-    assert info == {'username': 'alice', 'kid': data['kid'], 'scopes': None,
+    assert info == {'username': 'alice', 'tenant': None, 'kid': data['kid'], 'scopes': None,
                     'expires': data['expires']}
     assert apikey.validate_bearer_token(data['token'], cfm) == 'alice'
 
@@ -220,7 +220,7 @@ def test_request_allowed(scopes, operation, path, expected):
 async def test_legacy_keys_still_work(cfm):
     token = await _legacy_token(cfm, expiration=False)
     info = apikey.validate_bearer(token, cfm)
-    assert info == {'username': 'alice', 'kid': None, 'scopes': None, 'expires': None}
+    assert info == {'username': 'alice', 'tenant': None, 'kid': None, 'scopes': None, 'expires': None}
 
 
 async def test_legacy_keys_can_be_disabled(cfm):

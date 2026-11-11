@@ -32,6 +32,7 @@ except ImportError:
 import asyncio
 from aiohttp import web, WSMsgType
 import confluent.apikey as apikey
+import confluent.tenancy as tenancy
 import confluent.auth as auth
 import confluent.config.attributes as attribs
 import confluent.config.configmanager as configmanager
@@ -333,6 +334,7 @@ async def _authorize_request(req, operation, reqbody):
                     name = httpsessions[sessionid]['name']
                     authdata = auth.authorize(
                         name, element=element, operation=operation,
+                        tenant=httpsessions[sessionid].get('tenant'),
                         skipuserobj=httpsessions[sessionid]['skipuserobject'])
 
     if (not authdata) and 'Authorization' in req.headers:
@@ -346,15 +348,15 @@ async def _authorize_request(req, operation, reqbody):
             return ('logout',)
         authorization = req.headers['Authorization']
         if authorization.startswith('Bearer '):
-            keyinfo = apikey.validate_bearer(
-                authorization[7:], configmanager.ConfigManager(None))
+            keyinfo = apikey.validate_bearer(authorization[7:])
             name = keyinfo['username'] if keyinfo else None
             if name:
                 if not apikey.request_allowed(keyinfo, operation,
                                               req.rel_url.path):
                     return {'code': 403}
                 authdata = auth.authorize(
-                    name, element=element, operation=operation)
+                    name, element=element, operation=operation,
+                    tenant=keyinfo['tenant'])
                 if authdata is False:
                     return {'code': 403}
                 elif not authdata:
@@ -431,7 +433,7 @@ def _session_apikey_denied(sessionid, operation, path):
     keyinfo = httpsessions[sessionid].get('apikey')
     if keyinfo is None:
         return None
-    if not apikey.key_is_current(configmanager.ConfigManager(None), keyinfo):
+    if not apikey.key_is_current(None, keyinfo):
         forwarder.close_session(sessionid)
         del httpsessions[sessionid]
         return 401
@@ -444,9 +446,12 @@ def _establish_http_session(req, authdata, name, cookie):
     sessid = util.randomstring(32)
     while sessid in httpsessions:
         sessid = util.randomstring(32)
-    httpsessions[sessid] = {'name': name, 'expiry': time.time() + 90,
-                                'skipuserobject': authdata[4],
-                                'inflight': set([])}
+    # The session keeps the authenticated user name and tenant separately,
+    # so reusing it can never resolve the name in another tenant.
+    httpsessions[sessid] = {'name': authdata[2], 'tenant': authdata[3],
+                            'expiry': time.time() + 90,
+                            'skipuserobject': authdata[4],
+                            'inflight': set([])}
     if 'ConfluentAuthToken' in req.headers:
         httpsessions[sessid]['csrftoken'] = util.randomstring(32)
     cookie['confluentsessionid'] = util.stringify(sessid)
@@ -538,7 +543,10 @@ async def wsock_handler(req):
         return
     httpsessions[sessid]['inflight'].add(rsp)
     name = httpsessions[sessid]['name']
-    authdata = auth.authorize(name, req.rel_url.path, operation='start')
+    sesstenant = httpsessions[sessid].get('tenant')
+    sesskey = httpsessions[sessid].get('apikey')
+    authdata = auth.authorize(name, req.rel_url.path, operation='start',
+                              tenant=sesstenant)
     if not authdata:
         return
     cfgmgr = httpsessions[sessid]['cfgmgr']
@@ -580,7 +588,12 @@ async def wsock_handler(req):
                                 action = msg.get('action', None)
                             targ = msg.get('target', None)
                             if targ:
-                                authdata = auth.authorize(name, targ, operation=action)
+                                if sesskey is not None and not (
+                                        apikey.key_is_current(None, sesskey) and
+                                        apikey.request_allowed(sesskey, action, targ)):
+                                    continue
+                                authdata = auth.authorize(name, targ, operation=action,
+                                                          tenant=sesstenant)
                                 if not authdata:
                                     continue
                             if action == 'start':
@@ -811,6 +824,15 @@ async def resourcehandler_backend(req, make_response):
     if not operation:
         rsp = await make_response(mimetype, 400, 'Bad Request')
         await rsp.write(b'Unsupported method')
+        return rsp
+    if reqpath == '/tenantenrollment':
+        # The one unauthenticated tenant call: the enrollment token is the
+        # credential, and it can be used once.
+        if req.method != 'POST':
+            return await make_response('application/json', 405, 'Method Not Allowed')
+        status, result = await tenancy.redeem_enrollment_request(reqbody)
+        rsp = await make_response('application/json', status)
+        await rsp.write(json.dumps(result).encode('utf8'))
         return rsp
     querydict = _get_query_dict(req, reqbody, reqtype)
     if operation != 'retrieve' and 'restexplorerop' in querydict:

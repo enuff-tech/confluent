@@ -25,6 +25,7 @@ import re
 import secrets
 import time
 
+import confluent.auth as auth
 import confluent.config.configmanager as configmanager
 
 
@@ -109,13 +110,29 @@ def _user_root_secret(cfgmgr, username):
     return secret, user
 
 
-def validate_bearer(token, cfgmgr):
+def _manager_for(tenant, cfgmgr=None):
+    """The configuration a key of this tenant is checked against, or None
+    when that tenant cannot be used."""
+    if tenant is not None and not auth.tenant_usable(tenant):
+        return None
+    if cfgmgr is not None and cfgmgr.tenant == tenant:
+        return cfgmgr
+    try:
+        return configmanager.ConfigManager(tenant)
+    except ValueError:  # deleted meanwhile
+        return None
+
+
+def validate_bearer(token, cfgmgr=None):
     """Check a bearer token.
 
     Returns None when the token is not valid, else a dict describing the
-    key: 'username', 'kid' (None for a legacy key), 'scopes' (None when
-    the key may do anything its user may do) and 'expires' (None for a
-    legacy key without expiry).
+    key: 'username', 'tenant' (None for the default tenant), 'kid' (None
+    for a legacy key), 'scopes' (None when the key may do anything its
+    user may do) and 'expires' (None for a legacy key without expiry).
+
+    The tenant comes from the signed 'tnt' claim of a v2 key; a token
+    without it is only ever checked against the default tenant.
     """
     try:
         encoded_header, encoded_payload, encoded_signature = token.split('.')
@@ -131,13 +148,23 @@ def validate_bearer(token, cfgmgr):
     if not isinstance(username, str) or not username:
         return None
     if header == {'alg': 'HS256', 'typ': 'JWT'}:
+        cfgmgr = _manager_for(None, cfgmgr)
         return _validate_legacy(cfgmgr, username, payload, encoded_header,
                                 encoded_payload, signature)
     if (isinstance(header, dict) and set(header) == {'alg', 'typ', 'kid'} and
             header['alg'] == 'HS256' and header['typ'] == 'JWT' and
             isinstance(header['kid'], str) and _KID_RE.match(header['kid'])):
-        return _validate_v2(cfgmgr, username, header['kid'], payload,
-                            encoded_header, encoded_payload, signature)
+        tenant = payload.get('tnt')
+        if tenant is not None and not configmanager.valid_tenant_id(tenant):
+            return None
+        cfgmgr = _manager_for(tenant, cfgmgr)
+        if cfgmgr is None:
+            return None
+        keyinfo = _validate_v2(cfgmgr, username, header['kid'], payload,
+                               encoded_header, encoded_payload, signature)
+        if keyinfo is not None:
+            keyinfo['tenant'] = tenant
+        return keyinfo
     return None
 
 
@@ -161,7 +188,7 @@ def _validate_legacy(cfgmgr, username, payload, encoded_header,
         return None
     if not _signature_ok(secret, encoded_header, encoded_payload, signature):
         return None
-    return {'username': username, 'kid': None, 'scopes': None,
+    return {'username': username, 'tenant': None, 'kid': None, 'scopes': None,
             'expires': expiration}
 
 
@@ -196,9 +223,13 @@ def validate_bearer_token(token, cfgmgr):
 
 def key_is_current(cfgmgr, keyinfo):
     """Whether a key that was valid earlier still is (not expired, not
-    revoked). Used when a session established with the key is reused."""
+    revoked, its tenant still usable). Used when a session established
+    with the key is reused."""
     expires = keyinfo.get('expires')
     if expires is not None and expires <= time.time():
+        return False
+    cfgmgr = _manager_for(keyinfo.get('tenant'), cfgmgr)
+    if cfgmgr is None:
         return False
     root, user = _user_root_secret(cfgmgr, keyinfo['username'])
     if root is None:
@@ -257,9 +288,11 @@ def _new_kid():
         'ascii').lower().rstrip('=')
 
 
-def _make_v2_jws(username, kid, secret, issued, expires):
+def _make_v2_jws(username, kid, secret, issued, expires, tenant=None):
     header = {'alg': 'HS256', 'typ': 'JWT', 'kid': kid}
     payload = {'sub': username, 'iat': issued, 'exp': expires}
+    if tenant is not None:
+        payload['tnt'] = tenant
     encoded_header = _base64url(json.dumps(
         header, separators=(',', ':')).encode('utf8'))
     encoded_payload = _base64url(json.dumps(
@@ -381,7 +414,7 @@ async def handle_v2_request(url, username, cfgmgr, reqbody, method):
     await cfgmgr.set_user(username, {_KEYS_ATTRIBUTE: records})
     result = _public_record(kid, records[kid])
     result['token'] = _make_v2_jws(username, kid, _key_secret(root, kid),
-                                   now, expires)
+                                   now, expires, tenant=cfgmgr.tenant)
     return 200, result
 
 async def handle_api_request(url, username, cfgmgr, reqbody, method):
@@ -401,8 +434,9 @@ async def handle_api_request(url, username, cfgmgr, reqbody, method):
         else:
             return 405, {'error': 'Method Not Allowed'}
     if operation == 'create':
-        if not legacy_keys_allowed():
-            return 403, {'error': 'Legacy API keys are disabled; use '
+        if not legacy_keys_allowed() or cfgmgr.tenant is not None:
+            # Legacy tokens carry no tenant, so tenants only get v2 keys.
+            return 403, {'error': 'Legacy API keys are not available; use '
                                   '/sessions/current/apikeys'}
         try:
             expiration = _get_expiration(reqbody)

@@ -55,6 +55,7 @@ try:
 except ImportError:
     pass
 import confluent.tasks as tasks
+import confluent.tenancy as tenancy
 import confluent.util as util
 import inspect
 import msgpack
@@ -1546,6 +1547,16 @@ async def handle_path(path, operation, configmanager, inputdata=None, autostrip=
                 configmanager=configmanager)
             await update_user(user, inputdata.attribs, configmanager)
             return show_user(user, configmanager)
+    elif pathcomponents[0] == 'tenants':
+        if configmanager.tenant is not None:
+            raise exc.NotFoundException('Invalid element requested')
+        return await tenancy.handle_tenants_request(pathcomponents, operation,
+                                                    inputdata)
+    elif pathcomponents[0] == 'platform':
+        if configmanager.tenant is not None:
+            raise exc.NotFoundException('Invalid element requested')
+        return await tenancy.handle_platform_request(pathcomponents, operation,
+                                                     inputdata)
     elif pathcomponents[0] == 'events':
         try:
             element = pathcomponents[1]
