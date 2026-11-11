@@ -15,7 +15,9 @@
 # limitations under the License.
 
 import asyncio
+import aiohmi.util.netcontext as netcontext
 import confluent.neighutil as neighutil
+import confluent.netutil as netutil
 import confluent.tasks as tasks
 import confluent.util as util
 import confluent.log as log
@@ -213,13 +215,14 @@ async def _find_srvtype(net, net4, srvtype, addresses, xid):
     data = _generate_request_payload(srvtype, True, xid)
     if addresses is not None:
         for addr in addresses:
-            for saddr in await cloop.getaddrinfo(addr, 427):
+            for saddr in await netutil._getaddrinfo(addr, 427):
                 if saddr[0] == socket.AF_INET:
                     net4.sendto(data, saddr[4])
                 elif saddr[0] == socket.AF_INET6:
                     net.sendto(data, saddr[4])
     else:
-        net4.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        if not _in_tenant():  # a tenant's socket is opened for broadcast
+            net4.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         v6addrs = []
         v6hash = _v6mcasthash(srvtype)
         # do 'interface local' and 'link local'
@@ -227,9 +230,12 @@ async def _find_srvtype(net, net4, srvtype, addresses, xid):
         # local that do not work with link local
         v6addrs.append(('ff01::1:' + v6hash, 427, 0, 0))
         v6addrs.append(('ff02::1:' + v6hash, 427, 0, 0))
-        for idx in util.list_interface_indexes():
+        for idx in netutil.interface_indexes():
             # IPv6 multicast is by index, so lead with that
-            net.setsockopt(IPPROTO_IPV6, socket.IPV6_MULTICAST_IF, idx)
+            try:
+                net.setsockopt(IPPROTO_IPV6, socket.IPV6_MULTICAST_IF, idx)
+            except socket.error:
+                continue
             for sa in v6addrs:
                 try:
                     net.sendto(data, sa)
@@ -238,7 +244,7 @@ async def _find_srvtype(net, net4, srvtype, addresses, xid):
                     # this can cause an error, skip such an interface
                     # case in point, 'lo'
                     pass
-        for i4 in util.list_ips():
+        for i4 in netutil.ipv4_interfaces():
             if 'broadcast' not in i4:
                 continue
             addr = i4['addr']
@@ -354,9 +360,9 @@ async def _add_attributes(parsed):
     if not target:
         target = parsed['addresses'][0]
     if len(target) == 4:
-        net = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+        net = netutil.stream_socket(socket.AF_INET6)
     else:
-        net = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        net = netutil.stream_socket(socket.AF_INET)
     cloop = asyncio.get_running_loop()
     try:
         net.settimeout(0)
@@ -388,9 +394,9 @@ async def query_srvtypes(target):
     header = _generate_slp_header(payload, False, functionid=9, xid=1)
     packet = header + payload
     if len(target) == 2:
-        net = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        net = netutil.stream_socket(socket.AF_INET)
     elif len(target) == 4:
-        net = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+        net = netutil.stream_socket(socket.AF_INET6)
     else:
         raise Exception('Unrecognized target {0}'.format(repr(target)))
     tries = 3
@@ -437,6 +443,10 @@ def relay_packet(sock, pktq):
         return
     pktq.put_nowait((sock, rsp, peer))
 
+def _in_tenant():
+    return netcontext.current_network.get() is not None
+
+
 async def snoop(handler, protocol=None):
     """Watch for SLP activity
 
@@ -447,23 +457,36 @@ async def snoop(handler, protocol=None):
     """
     tracelog = log.Logger('trace')
     try:
-        await active_scan(handler, protocol)
+        if not _in_tenant():  # a tenant's networks are searched once it listens
+            await active_scan(handler, protocol)
     except Exception:
         tracelog.log(traceback.format_exc(), ltype=log.DataTypes.event,
                         event=log.Events.stacktrace)
-    net = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
-    net.setsockopt(IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+    tenant = _in_tenant()
+    if tenant:
+        # the tenant's own network: sockets from its broker, already bound
+        net = netutil.tenant_udp_socket(socket.AF_INET6, 427)
+        net4 = netutil.tenant_udp_socket(socket.AF_INET, 427)
+    else:
+        net = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+        net.setsockopt(IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
     slpg = socket.inet_pton(socket.AF_INET6, 'ff01::123')
     slpg2 = socket.inet_pton(socket.AF_INET6, 'ff02::123')
-    for i6idx in util.list_interface_indexes():
-        mreq = slpg + struct.pack('=I', i6idx)
-        net.setsockopt(IPPROTO_IPV6, socket.IPV6_JOIN_GROUP, mreq)
-        mreq = slpg2 + struct.pack('=I', i6idx)
-        net.setsockopt(IPPROTO_IPV6, socket.IPV6_JOIN_GROUP, mreq)
-    net4 = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    net.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    net4.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    for i4 in util.list_ips():
+    for i6idx in netutil.interface_indexes():
+        try:
+            mreq = slpg + struct.pack('=I', i6idx)
+            net.setsockopt(IPPROTO_IPV6, socket.IPV6_JOIN_GROUP, mreq)
+            mreq = slpg2 + struct.pack('=I', i6idx)
+            net.setsockopt(IPPROTO_IPV6, socket.IPV6_JOIN_GROUP, mreq)
+        except socket.error:
+            if not tenant:
+                raise
+            # interfaces of a tenant without IPv6 (or multicast)
+    if not tenant:
+        net4 = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        net.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        net4.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    for i4 in netutil.ipv4_interfaces():
         if 'broadcast' not in i4:
             continue
         slpmcast = socket.inet_aton('239.255.255.253') + \
@@ -475,8 +498,9 @@ async def snoop(handler, protocol=None):
             if e.errno != 98:
                 raise
             # socket in use can occur when aliased ipv4 are encountered
-    net.bind(('', 427))
-    net4.bind(('', 427))
+    if not tenant:
+        net.bind(('', 427))
+        net4.bind(('', 427))
     pktq = asyncio.Queue()
     cloop = asyncio.get_running_loop()
     cloop.add_reader(net, relay_packet, net, pktq)
@@ -611,8 +635,13 @@ async def scan(srvtypes=_slp_services, addresses=None, localonly=False):
                       range, or an IP/CIDR indication of a network.
     :return: Iterable set of results
     """
-    net = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
-    net4 = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    if _in_tenant():
+        net = netutil.tenant_udp_socket(socket.AF_INET6, reuseaddr=False)
+        net4 = netutil.tenant_udp_socket(socket.AF_INET, broadcast=True,
+                                         reuseaddr=False)
+    else:
+        net = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+        net4 = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     # increase RCVBUF to max, mitigate chance of
     # failure due to full buffer.
     net.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 16777216)
@@ -653,6 +682,8 @@ async def scan(srvtypes=_slp_services, addresses=None, localonly=False):
         for defer in deferrals:
             rsp, peer = defer
             await _parse_slp_packet(rsp, peer, rsps, xidmap)
+    net.close()
+    net4.close()
     # now to analyze and flesh out the responses
     handleids = set([])
     tsks = []

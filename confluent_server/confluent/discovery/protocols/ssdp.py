@@ -44,6 +44,7 @@ import struct
 import traceback
 
 import aiohmi.util.webclient as webclient
+import aiohmi.util.netcontext as netcontext
 mcastv4addr = '239.255.255.250'
 mcastv6addr = 'ff02::c'
 
@@ -138,15 +139,28 @@ async def check_fish_handler(handler, peerdata, known_peers, newmacs, peerbymaca
         machandlers[mac] = handler
 
 
+def _in_tenant():
+    return netcontext.current_network.get() is not None
+
+
 def _open_snoop_sockets(cloop, pktq):
-    net6 = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
-    net6.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
-    for ifidx in util.list_interface_indexes():
+    if _in_tenant():
+        # the tenant's own network: sockets from its broker, already bound
+        net6 = netutil.tenant_udp_socket(socket.AF_INET6, 1900)
+        net4 = netutil.tenant_udp_socket(socket.AF_INET, 1900)
+    else:
+        net6 = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+        net6.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+        net4 = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    for ifidx in netutil.interface_indexes():
         v6grp = ssdp6mcast + struct.pack('=I', ifidx)
-        net6.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_JOIN_GROUP, v6grp)
-    net6.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    net4 = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    for i4 in util.list_ips():
+        try:
+            net6.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_JOIN_GROUP, v6grp)
+        except socket.error:
+            if not _in_tenant():
+                raise
+            # interfaces of a tenant without IPv6 (or multicast)
+    for i4 in netutil.ipv4_interfaces():
         ssdp4mcast = socket.inet_pton(socket.AF_INET, mcastv4addr) + \
                      socket.inet_aton(i4['addr'])
         try:
@@ -156,9 +170,11 @@ def _open_snoop_sockets(cloop, pktq):
             if e.errno != 98:
                 # errno 98 can happen if aliased, skip for now
                 raise
-    net4.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    net4.bind(('', 1900))
-    net6.bind(('', 1900))
+    if not _in_tenant():
+        net6.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        net4.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        net4.bind(('', 1900))
+        net6.bind(('', 1900))
     cloop.add_reader(net4, _relay_pkt, net4, pktq)
     cloop.add_reader(net6, _relay_pkt, net6, pktq)
     return net4, net6
@@ -277,7 +293,8 @@ async def snoop(handler, byehandler=None, protocol=None, uuidlookup=None):
     tracelog = log.Logger('trace')
     cloop = asyncio.get_running_loop()
     try:
-        await active_scan(handler, protocol)
+        if not _in_tenant():  # a tenant's networks are searched once it listens
+            await active_scan(handler, protocol)
     except Exception:
         tracelog.log(traceback.format_exc(), ltype=log.DataTypes.event,
                     event=log.Events.stacktrace)
@@ -348,7 +365,9 @@ async def snoop(handler, byehandler=None, protocol=None, uuidlookup=None):
                         continue
                     _process_snoop(peer, rsp, mac, known_peers, newmacs, peerbymacaddress, byehandler, machandlers, handler)
                 elif method == b'M-SEARCH':
-                    if not uuidlookup:
+                    if not uuidlookup or _in_tenant():
+                        # answering nodes that search for their deployment
+                        # server comes with tenant node-facing services
                         continue
                     #ip = peer[0].partition('%')[0]
                     for headline in rsp[1:]:
@@ -395,14 +414,18 @@ def _relay_pkt(sock, pktq):
 
 async def _find_service(service, target):
     cloop = asyncio.get_running_loop()
-    net4 = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    net6 = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
-    net6.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+    if _in_tenant():
+        net4 = netutil.tenant_udp_socket(socket.AF_INET, broadcast=True, reuseaddr=False)
+        net6 = netutil.tenant_udp_socket(socket.AF_INET6, reuseaddr=False)
+    else:
+        net4 = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        net6 = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+        net6.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
     pktq = asyncio.Queue()
     cloop.add_reader(net4, _relay_pkt, net4, pktq)
     cloop.add_reader(net6, _relay_pkt, net6, pktq)
     if target:
-        addrs = await cloop.getaddrinfo(target, 1900, type=socket.SOCK_DGRAM)
+        addrs = await netutil._getaddrinfo(target, 1900, type=socket.SOCK_DGRAM)
         for addr in addrs:
             host = addr[4][0]
             if addr[0] == socket.AF_INET:
@@ -417,10 +440,14 @@ async def _find_service(service, target):
                     msg = msg.encode('utf8')
                 net6.sendto(msg, addr[4])
     else:
-        net4.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        for idx in util.list_interface_indexes():
-            net6.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_MULTICAST_IF,
-                            idx)
+        if not _in_tenant():
+            net4.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        for idx in netutil.interface_indexes():
+            try:
+                net6.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_MULTICAST_IF,
+                                idx)
+            except socket.error:
+                continue
             try:
                 msg = smsg.format('[{0}]'.format(mcastv6addr), service)
                 if not isinstance(msg, bytes):
@@ -429,7 +456,7 @@ async def _find_service(service, target):
             except socket.error:
                 # ignore interfaces without ipv6 multicast causing error
                 pass
-        for i4 in util.list_ips():
+        for i4 in netutil.ipv4_interfaces():
             if 'broadcast' not in i4:
                 continue
             addr = i4['addr']
@@ -483,6 +510,10 @@ async def _find_service(service, target):
     for dp in deferparse:
         rsp, peer = dp
         await _parse_ssdp(peer, rsp, peerdata)
+    for sock in (net4, net6):
+        # the search is over: stop listening
+        cloop.remove_reader(sock)
+        sock.close()
     pooltargs = []
     for nid in peerdata:
         if peerdata[nid].get('services', [None])[0] == 'urn::service:affluent:1':

@@ -79,6 +79,16 @@ def _reset_module_state():
     configmanager.statelessmode = False
     auth._passcache.clear()
     auth._passchecking.clear()
+    disco = sys.modules.get('confluent.discovery.core')
+    if disco is not None:
+        # discovery listeners of the tenants of the previous test
+        for tenant in list(disco._tenant_listeners):
+            disco.stop_tenant_detection(tenant)
+    tenantstate = sys.modules.get('confluent.tenantstate')
+    if tenantstate is not None:
+        # per-tenant module state (discovery, PXE) of the previous test
+        for scoped in tenantstate._scoped:
+            scoped._stores.clear()
 
 
 class ConfluentConfig(object):

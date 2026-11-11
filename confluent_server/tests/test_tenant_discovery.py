@@ -163,7 +163,13 @@ async def test_rescan_stays_within_the_tenant(tenants, monkeypatch):
     assert result == {'rescan': 'started'}
     assert rechecked == [(A, MAC)]
     assert disco.scanner is None and not started
+    # its own networks are searched instead (here it has none: the search
+    # ends at once)
+    scan = disco._tenant_scan.for_tenant(A).get('scanner')
+    if scan is not None:
+        await scan
     assert _kv(await _as(A, '/discovery/rescan')) == {'scanning': False}
+    assert _kv(await _as(B, '/discovery/rescan')) == {'scanning': False}
 
 
 async def test_subscriptions_are_the_hosts(tenants):

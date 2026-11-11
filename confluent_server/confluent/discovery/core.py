@@ -560,8 +560,8 @@ def handle_autosense_config(operation, inputdata):
             stop_autosense()
 
 def handle_tenant_autosense_config(configmanager, operation, inputdata):
-    """A tenant's own autosense setting. Listening for it in the tenant's
-    networks comes with per-tenant discovery listeners."""
+    """A tenant's own autosense setting: whether discovery listens in the
+    tenant's networks (see start_tenant_detection)."""
     autosense = configmanager.get_scoped_global('discovery.autosense')
     autosense = autosense or autosense is None
     if operation == 'retrieve':
@@ -572,6 +572,10 @@ def handle_tenant_autosense_config(configmanager, operation, inputdata):
             enabled = enabled.lower() in ('true', '1', 'y', 'yes', 'enable',
                                           'enabled')
         configmanager.set_scoped_global('discovery.autosense', bool(enabled))
+        if enabled:
+            start_tenant_detection(configmanager.tenant)
+        else:
+            stop_tenant_detection(configmanager.tenant)
         return [msg.KeyValueData({'enabled': bool(enabled)})]
     raise exc.InvalidArgumentException('Unsupported operation')
 
@@ -716,7 +720,9 @@ def handle_read_api_request(pathcomponents):
     #  odd indexes into components are 'by-'*, even indexes
     # starting at 2 are parameters to previous index
     if pathcomponents == ['discovery', 'rescan']:
-        return (msg.KeyValueData({'scanning': bool(scanner) and not _in_tenant()}),)
+        if _in_tenant():
+            return (msg.KeyValueData({'scanning': 'scanner' in _tenant_scan}),)
+        return (msg.KeyValueData({'scanning': bool(scanner)}),)
     if pathcomponents == ['discovery', 'alldata']:
         return dump_discovery()
     subcats, queryparms, indexof, coll = _parameterize_path(pathcomponents[1:])
@@ -753,9 +759,9 @@ def detected_models():
 async def _recheck_nodes(nodeattribs, configmanager):
     if not cfm.config_is_ready():
         return
-    global rechecklock
+    rechecklock = _recheck.get('lock')
     if rechecklock is None:
-        rechecklock = asyncio.Lock()
+        rechecklock = _recheck['lock'] = asyncio.Lock()
     if rechecklock.locked():
         # if already in progress, don't run again
         # it may make sense to schedule a repeat, but will try the easier and less redundant way first
@@ -764,7 +770,6 @@ async def _recheck_nodes(nodeattribs, configmanager):
         return await _recheck_nodes_backend(nodeattribs, configmanager)
 
 async def _recheck_nodes_backend(nodeattribs, configmanager):
-    global rechecker
     _map_unique_ids(nodeattribs)
     # for the nodes whose attributes have changed, consider them as potential
     # strangers
@@ -807,8 +812,6 @@ async def _recheck_single_unknown(configmanager, mac):
 
 
 async def _recheck_single_unknown_info(configmanager, info):
-    global rechecker
-    global rechecktime
     if not info or info['handler'] is None:
         return
     if info['handler'] != pxeh and not info.get('addresses', None):
@@ -832,12 +835,12 @@ async def _recheck_single_unknown_info(configmanager, info):
         else:
             infotxt = f'{handler.devname} at address {handler.ipaddr} is not yet running https, will examine later'
         log.log({'info': infotxt})
-        if rechecker is not None and rechecktime > util.monotonic_time() + 300:
-            rechecker.cancel()
+        if _recheck.get('task') is not None and _recheck['time'] > util.monotonic_time() + 300:
+            _recheck['task'].cancel()
         # if cancel did not result in dead, then we are in progress
-        if rechecker is None or rechecker.done():
-            rechecktime = util.monotonic_time() + 300
-            rechecker = tasks.spawn_task_after(300, _periodic_recheck,
+        if _recheck.get('task') is None or _recheck['task'].done():
+            _recheck['time'] = util.monotonic_time() + 300
+            _recheck['task'] = tasks.spawn_task_after(300, _periodic_recheck,
                                              configmanager)
         return
     nodename, info['maccount'] = await get_nodename(configmanager, handler, info)
@@ -875,8 +878,6 @@ async def eval_detected(info):
 
 
 async def detected(info):
-    global rechecker
-    global rechecktime
     if 'info_identifier' not in info:
         infoid = info.get('hwaddr', info.get('addresses', [[None]])[0][0])
         if not infoid:
@@ -972,11 +973,11 @@ async def detected(info):
                       'https, will examine later'.format(
                         handler.devname, info['hwaddr'], handler.ipaddr
             )})
-        if rechecker is not None and rechecktime > util.monotonic_time() + 300:
-            rechecker.cancel()
-        if rechecker is None or rechecker.done():
-            rechecktime = util.monotonic_time() + 300
-            rechecker = tasks.spawn_task_after(300, _periodic_recheck, cfg)
+        if _recheck.get('task') is not None and _recheck['time'] > util.monotonic_time() + 300:
+            _recheck['task'].cancel()
+        if _recheck.get('task') is None or _recheck['task'].done():
+            _recheck['time'] = util.monotonic_time() + 300
+            _recheck['task'] = tasks.spawn_task_after(300, _periodic_recheck, cfg)
         unknown_info[info['info_identifier']] = info
         info['discostatus'] = 'unidentified'
         #TODO, spawn after to recheck sooner, or somehow else
@@ -1277,7 +1278,7 @@ def get_node_guess_by_uuid(uuid):
     return None
 
 def get_node_by_uuid_or_mac(uuidormac):
-    node = pxe.macmap.get(uuidormac, None)
+    node = pxe.macmap.get(uuidormac, None)  # the current tenant's
     if node is not None:
         return node
     return nodes_by_uuid.get(uuidormac, None)
@@ -1755,14 +1756,12 @@ async def newnodes(added, deleting, renamed, configmanager):
 
 
 
-rechecker = None
-rechecktime = None
-rechecklock = None
+# The periodic recheck of each tenant: its 'task', the 'time' it is due
+# and the 'lock' held while one runs.
+_recheck = tenantstate.TenantScoped()
 
 async def _periodic_recheck(configmanager):
-    global rechecker
-    global rechecktime
-    rechecker = None
+    _recheck['task'] = None
     try:
         await _recheck_nodes((), configmanager)
     except Exception:
@@ -1771,20 +1770,22 @@ async def _periodic_recheck(configmanager):
                           'logs'})
     # if rechecker is set, it means that an accelerated schedule
     # for rechecker was requested in the course of recheck_nodes
-    if rechecker is None:
-        rechecktime = util.monotonic_time() + 900
-        rechecker = tasks.spawn_task_after(900, _periodic_recheck,
+    if _recheck.get('task') is None:
+        _recheck['time'] = util.monotonic_time() + 900
+        _recheck['task'] = tasks.spawn_task_after(900, _periodic_recheck,
                                          configmanager)
 
 
 async def rescan(aggressive=False):
     _map_unique_ids()
     if _in_tenant():
-        # Re-evaluate what this tenant has detected. Scanning a tenant's
-        # networks needs listeners in them, which tenants do not have yet.
+        # Re-evaluate what this tenant has detected, and search its own
+        # networks again (through its broker).
         cfg = _current_cfm()
         for mac in list(unknown_info):
             await _recheck_single_unknown(cfg, mac)
+        if 'scanner' not in _tenant_scan:
+            _tenant_scan['scanner'] = tasks.spawn_task(_tenant_scan_networks())
         return
     global scanner
     if scanner:
@@ -1880,8 +1881,6 @@ async def generic_eval(address, hwaddr=None):
 
 def start_detection():
     global attribwatcher
-    global rechecker
-    global rechecktime
     _map_unique_ids()
     cfg = _current_cfm()
     allnodes = cfg.list_nodes()
@@ -1893,10 +1892,208 @@ def start_detection():
     autosense = cfm.get_global('discovery.autosense')
     if autosense or autosense is None:
         start_autosense()
-    if rechecker is None:
-        rechecktime = util.monotonic_time() + 900
-        rechecker = tasks.spawn_task_after(900, _periodic_recheck, cfg)
+    if _recheck.get('task') is None:
+        _recheck['time'] = util.monotonic_time() + 900
+        _recheck['task'] = tasks.spawn_task_after(900, _periodic_recheck, cfg)
     tasks.spawn(ssdp.snoop(safe_detected, None, ssdp, get_node_by_uuid_or_mac))
+    if cfm.multitenancy_enabled():
+        for tenant in cfm.list_tenants():
+            start_tenant_detection(tenant)
+
+
+# ---------------------------------------------------------------------
+# Discovery within tenants' networks
+#
+# Each active tenant with autosense enabled has its own listeners (SSDP,
+# SLP and DHCP), on sockets its network broker opens in its namespace. A
+# packet is attributed to a tenant by the socket it arrived on, never by
+# anything it contains, and is handled by tasks that work for that tenant
+# only: its state (tenantstate), its configuration and its network.
+
+_tenant_listeners = {}
+_tenant_scan = tenantstate.TenantScoped()
+TENANT_LISTENER_RETRY = 30
+
+
+def _tenant_autosense(tenant):
+    autosense = cfm.ConfigManager(tenant).get_scoped_global('discovery.autosense')
+    return autosense or autosense is None
+
+
+def _tenant_wants_detection(tenant):
+    record = cfm.get_tenant(tenant)
+    return bool(cfm.multitenancy_enabled() and record
+                and record['state'] == 'active' and _tenant_autosense(tenant))
+
+
+def start_tenant_detection(tenant):
+    """Listen for hardware in a tenant's networks (if it is active and
+    has autosense enabled); returns whether listeners are (being) set up."""
+    if tenant is None or tenant in _tenant_listeners:
+        return tenant in _tenant_listeners
+    if not _tenant_wants_detection(tenant):
+        return False
+    state = {'tasks': [], 'sockets': [], 'watchers': None, 'listening': False}
+    _tenant_listeners[tenant] = state
+    try:
+        # a task of its own: the tenant context it enters stays with it
+        # and the tasks it starts
+        state['tasks'].append(tasks.spawn_task(_tenant_detection(tenant, state)))
+    except RuntimeError:  # no event loop (configuration tools)
+        del _tenant_listeners[tenant]
+        return False
+    return True
+
+
+def stop_tenant_detection(tenant):
+    """Stop listening in a tenant's networks and close every socket
+    opened there for it."""
+    state = _tenant_listeners.pop(tenant, None)
+    if state is None:
+        return
+    for task in state['tasks']:
+        task.cancel()
+    recheck = _recheck.for_tenant(tenant).pop('task', None)
+    if recheck is not None:
+        recheck.cancel()
+    scan = _tenant_scan.for_tenant(tenant).pop('scanner', None)
+    if scan is not None:
+        scan.cancel()
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    for sock in state['sockets']:
+        if sock.fileno() == -1:
+            continue
+        if loop is not None:
+            try:
+                loop.remove_reader(sock)
+            except Exception:
+                pass
+        sock.close()
+    del state['sockets'][:]
+    if state['watchers'] and cfm.get_tenant(tenant):
+        cfg = cfm.ConfigManager(tenant)
+        for watcher in state['watchers']:
+            try:
+                cfg.remove_watcher(watcher)
+            except Exception:
+                pass
+
+
+def tenant_detection_status(tenant):
+    """None if nothing listens for the tenant, else whether its
+    listeners are up (False while its network is not reachable yet)."""
+    state = _tenant_listeners.get(tenant)
+    return None if state is None else state['listening']
+
+
+def _for_tenant(tenant, func):
+    """func as a configuration watcher that works for tenant, whichever
+    task the change came from."""
+    async def watcher(*args):
+        async def run():
+            tenantnet.enter(tenant)
+            result = func(*args)
+            if inspect.isawaitable(result):
+                await result
+        await tasks.spawn_task(run())
+    return watcher
+
+
+async def _tenant_nodes_changed(added, deleting, renamed, configmanager):
+    for node in set(deleting) | set(renamed):
+        for mac in known_nodes.get(node, {}):
+            known_info.pop(mac, None)
+        known_nodes.pop(node, None)
+    _map_unique_ids()
+    state = _tenant_listeners.get(configmanager.tenant)
+    if state is not None and state['watchers']:
+        configmanager.remove_watcher(state['watchers'][0])
+        state['watchers'][0] = _watch_tenant_attributes(configmanager)
+    await _recheck_nodes((), configmanager)
+
+
+def _watch_tenant_attributes(cfg):
+    return cfg.watch_attributes(
+        cfg.list_nodes(), ('discovery.policy', 'hardwaremanagement.manager',
+                           'id.uuid', 'pubkeys.tls_hardwaremanager',
+                           'net*.bootable'),
+        _for_tenant(cfg.tenant, _recheck_nodes))
+
+
+async def _tenant_detection(tenant, state):
+    tenantnet.enter(tenant)
+    state['sockets'] = netutil.listener_scope()
+    net = tenantnet.current_network()
+    reported = False
+    while True:
+        try:
+            await net.alist_interfaces()
+            break
+        except tenantnet.TenantNetworkError as e:
+            # no network (yet): its namespace and broker are set up by
+            # the host administrator
+            if not reported:
+                reported = True
+                log.log({'info': 'Discovery is not listening for tenant {0} '
+                                 'until its network is available: {1}'.format(tenant, e)})
+            await asyncio.sleep(TENANT_LISTENER_RETRY)
+    cfg = cfm.ConfigManager(tenant)
+    _map_unique_ids()
+    state['watchers'] = [
+        _watch_tenant_attributes(cfg),
+        cfg.watch_nodecollection(_for_tenant(tenant, _tenant_nodes_changed)),
+    ]
+    for listener in (ssdp.snoop(safe_detected, None, ssdp, None),
+                     slp.snoop(safe_detected, slp),
+                     pxe.snoop(safe_detected, pxe, get_node_guess_by_uuid)):
+        state['tasks'].append(tasks.spawn_task(_tenant_listener(tenant, listener)))
+    await asyncio.sleep(0)  # each listener binds before it first waits
+    state['listening'] = True
+    # and, now that answers will be heard, search the networks once
+    _tenant_scan['scanner'] = tasks.spawn_task(_tenant_scan_networks())
+    log.log({'info': 'Discovery is listening in the networks of tenant {0}'.format(tenant)})
+
+
+async def _tenant_listener(tenant, listener):
+    try:
+        await listener
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.log({'error': 'A discovery listener of tenant {0} failed, check '
+                          'the trace log'.format(tenant)})
+        log.logtrace()
+
+
+async def _tenant_scan_networks():
+    try:
+        for protocol in (slp, ssdp):
+            try:
+                await protocol.active_scan(safe_detected, protocol)
+            except tenantnet.TenantNetworkError as e:
+                log.log({'error': 'Unable to scan the networks of tenant '
+                                  '{0}: {1}'.format(tenantguard.current_tenant.get(), e)})
+                break
+            except Exception:
+                log.logtrace()
+    finally:
+        # unless a later scan has taken its place (this one was cancelled)
+        if _tenant_scan.get('scanner') is asyncio.current_task():
+            del _tenant_scan['scanner']
+
+
+def _tenant_state_changed(tenant, state):
+    if state == 'active':
+        start_tenant_detection(tenant)
+    else:
+        stop_tenant_detection(tenant)
+
+
+cfm.watch_tenant_state(_tenant_state_changed)
+
 
 def stop_autosense():
     for watcher in list(autosensors):

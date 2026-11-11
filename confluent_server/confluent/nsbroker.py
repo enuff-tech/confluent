@@ -23,7 +23,8 @@ being able to enter a namespace itself.
 It is deliberately not a general-purpose privileged service:
 
 * The operation set is closed: no exec, no file access, no setsockopt
-  proxy, no netlink writes. Arguments are checked against strict schemas,
+  proxy, no netlink writes (neighbor lookups read with the broker's own
+  netlink socket, which is never handed out). Arguments are checked against strict schemas,
   and bind ports and ethertypes against fixed allowlists.
 * Only peers with an allowed uid (SO_PEERCRED) are served.
 * It keeps no tenant sockets: each one is closed as soon as it is sent.
@@ -326,6 +327,61 @@ def op_list_interfaces(ctx, args):
     return {'interfaces': found}, None
 
 
+def _neighbor_dump():
+    """(address bytes, mac bytes) of this namespace's neighbor table, read
+    with an RTM_GETNEIGH dump. The netlink socket is the broker's own and
+    is never handed out."""
+    nl = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, socket.NETLINK_ROUTE)
+    try:
+        nl.bind((0, 0))
+        nl.settimeout(2)
+        # nlmsghdr (len, RTM_GETNEIGH, NLM_F_REQUEST|NLM_F_DUMP, seq, pid)
+        # and an all-zero ndmsg
+        nl.send(struct.pack('IHHII', 28, 30, 0x301, 1, 0) + b'\x00' * 12)
+        while True:
+            data = nl.recv(65536)
+            while data:
+                length, kind = struct.unpack('IH', data[:6])
+                if length < 16 or kind in (2, 3):  # NLMSG_ERROR, NLMSG_DONE
+                    return
+                if kind == 28:  # RTM_NEWNEIGH
+                    ndtype = struct.unpack('B', data[27:28])[0]
+                    rta, addr, mac = data[28:length], None, None
+                    while len(rta) >= 4:
+                        rtalen, rtatype = struct.unpack('HH', rta[:4])
+                        if rtalen < 4:
+                            break
+                        if rtatype == 1:
+                            addr = rta[4:rtalen]
+                        elif rtatype == 2:
+                            mac = rta[4:rtalen]
+                        rta = rta[(rtalen + 3) & ~3:]
+                    if ndtype == 1 and addr and mac and len(mac) == 6:
+                        yield addr, mac
+                data = data[(length + 3) & ~3:]
+    finally:
+        nl.close()
+
+
+def op_neighbor(ctx, args):
+    """The hardware address this namespace has learned for one address."""
+    _args(args, ('address',))
+    address = args['address']
+    try:
+        if not isinstance(address, str):
+            raise ValueError(address)
+        packed = ipaddress.ip_address(address).packed
+    except ValueError:
+        raise RpcError('EINVAL', 'invalid address')
+    try:
+        for addr, mac in _neighbor_dump():
+            if addr == packed:
+                return {'mac': ':'.join('%02x' % b for b in bytearray(mac))}, None
+    except OSError as e:
+        raise RpcError('EIO', str(e))
+    return {'mac': None}, None
+
+
 def op_resolve(ctx, args):
     _args(args, ('name',), ('family',))
     name = args['name']
@@ -348,6 +404,7 @@ OPS = {
     'raw_icmp': op_raw_icmp,
     'packet_socket': op_packet_socket,
     'list_interfaces': op_list_interfaces,
+    'neighbor': op_neighbor,
     'resolve': op_resolve,
 }
 

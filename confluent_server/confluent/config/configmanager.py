@@ -807,6 +807,7 @@ def _true_create_tenant(tenantid, name, wrappedkey, created):
         for key in store[area]:
             _mark_dirtykey(area, key, tenantid)
     ConfigManager._bg_sync_to_file()
+    _notify_tenant_state(tenantid, 'active')
 
 
 async def set_tenant_state(tenantid, state):

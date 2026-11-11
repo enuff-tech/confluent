@@ -289,6 +289,10 @@ class TenantNetwork(object):
     def list_interfaces(self):
         return self.broker.call('list_interfaces', {})[0]['interfaces']
 
+    def neighbor(self, address):
+        """The hardware address learned for address, or None."""
+        return self.broker.call('neighbor', {'address': address})[0]['mac']
+
     def resolve(self, name, family='inet'):
         return self.broker.call('resolve', {'name': name, 'family': family})[0]['addresses']
 
@@ -343,8 +347,20 @@ class TenantNetworkRef(object):
     def _net(self):
         return network_for(self.tenant)
 
-    def udp_socket(self, family):
-        return self._net().udp_socket(family=_family_name(family))
+    def udp_socket(self, family, port=0, broadcast=False, pktinfo=False,
+                   reuseaddr=False):
+        return self._net().udp_socket(
+            family=_family_name(family), port=port, broadcast=broadcast,
+            pktinfo=pktinfo, reuseaddr=reuseaddr)
+
+    def packet_socket(self, ifname, ethertype, kind='raw'):
+        return self._net().packet_socket(ifname, ethertype, kind)
+
+    def list_interfaces(self):
+        return self._net().list_interfaces()
+
+    def neighbor(self, address):
+        return self._net().neighbor(address)
 
     def socket_factory(self, addrinfo):
         return self._net().tcp_socket(family=_family_name(addrinfo[0]))
