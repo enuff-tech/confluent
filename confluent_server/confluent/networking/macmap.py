@@ -694,8 +694,14 @@ async def handle_read_api_request(pathcomponents, configmanager):
     # TODO(jjohnson2): discovery core.py api handler design, apply it here
     # to make this a less tangled mess as it gets extended
     if len(pathcomponents) == 1:
-        return [msg.ChildCollection('macs/'),
-                msg.ChildCollection('neighbors/')]
+        collections = [msg.ChildCollection('macs/'),
+                       msg.ChildCollection('neighbors/')]
+        if configmanager.tenant is not None:
+            # the network a tenant manages for itself (see tenantnetcfg)
+            collections += [msg.ChildCollection('interfaces/'),
+                            msg.ChildCollection('routes'),
+                            msg.ChildCollection('dns')]
+        return collections
     elif pathcomponents[1] == 'neighbors':
         if len(pathcomponents) == 3 and pathcomponents[-1] == 'by-switch':
             return [msg.ChildCollection(x + '/')

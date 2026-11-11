@@ -47,6 +47,7 @@ import confluent.exceptions as exc
 import confluent.messages as msg
 import confluent.mountmanager as mountmanager
 import confluent.networking.macmap as macmap
+import confluent.networking.tenantnetcfg as tenantnetcfg
 import confluent.noderange as noderange
 import confluent.osimage as osimage
 import confluent.plugin as plugin
@@ -1530,6 +1531,10 @@ async def handle_path(path, operation, configmanager, inputdata=None, autostrip=
         return await disco.handle_api_request(
             configmanager, inputdata, operation, pathcomponents)
     elif pathcomponents[0] == 'networking':
+        if len(pathcomponents) > 1 and pathcomponents[1] in ('interfaces', 'routes', 'dns'):
+            # the network a tenant manages for itself
+            return await tenantnetcfg.handle_api_request(
+                configmanager, inputdata, operation, pathcomponents)
         return await macmap.handle_api_request(
             configmanager, inputdata, operation, pathcomponents)
     elif pathcomponents[0] == 'version':

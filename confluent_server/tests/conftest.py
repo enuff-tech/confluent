@@ -93,6 +93,11 @@ def _reset_module_state():
     if services is not None:
         for tenant in list(services._services):
             services.stop(tenant)
+    netcfg = sys.modules.get('confluent.networking.tenantnetcfg')
+    if netcfg is not None:
+        for tenant in list(netcfg._monitors):
+            netcfg.stop(tenant)
+        netcfg._applied.clear()
     logs = sys.modules.get('confluent.log')
     if logs is not None:
         # loggers remember the log directory they were opened in
@@ -202,6 +207,10 @@ async def no_tasks_left_behind():
     if services is not None:
         for tenant in list(services._services):
             services.stop(tenant)
+    netcfg = sys.modules.get('confluent.networking.tenantnetcfg')
+    if netcfg is not None:
+        for tenant in list(netcfg._monitors):
+            netcfg.stop(tenant)
     me = asyncio.current_task()
     pending = []
     for _ in range(100):
