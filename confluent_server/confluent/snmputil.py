@@ -23,6 +23,7 @@
 
 import asyncio
 import confluent.exceptions as exc
+import confluent.tenantnet as tenantnet
 import inspect
 import socket
 try:
@@ -35,6 +36,8 @@ except ImportError:
 import pysnmp.hlapi.asyncio as snmp
 
 async def _get_transport(name):
+    # pysnmp makes its own sockets, so it cannot use a tenant's network yet.
+    tenantnet.refuse_for_tenant('SNMP')
     # Annoyingly, pysnmp does not automatically determine ipv6 v ipv4
     res = await asyncio.get_running_loop().getaddrinfo(name, 161, type=socket.SOCK_DGRAM)
     if res[0][0] == socket.AF_INET6:

@@ -17,6 +17,7 @@ import asyncio
 
 import confluent.messages as msg
 import confluent.exceptions as exc
+import confluent.tenantnet as tenantnet
 import lxml.etree as etree
 
 def fromstring(inputdata):
@@ -46,6 +47,15 @@ class WebConnection(httplib.HTTPConnection):
     def __init__(self, host):
         httplib.HTTPConnection.__init__(self, host, 80)
         self.cookies = {}
+
+    def connect(self):
+        # A tenant's PDU is reached through the tenant's own network.
+        timeout = self.timeout if isinstance(self.timeout, (int, float)) else None
+        tenantsock = tenantnet.connect_blocking(self.host, self.port, timeout)
+        if tenantsock is not None:
+            self.sock = tenantsock
+            return
+        httplib.HTTPConnection.connect(self)
 
     def getresponse(self):
         try:

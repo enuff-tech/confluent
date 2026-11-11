@@ -27,6 +27,7 @@ install() gives the event loop a default executor that carries it into
 run_in_executor threads (asyncio.to_thread already does).
 """
 
+import collections
 import concurrent.futures
 import contextlib
 import contextvars
@@ -78,6 +79,16 @@ def _is_literal(host):
         return False
 
 
+# The most recent refusals, (tenant, event), for diagnostics: code that
+# catches every exception would otherwise hide that it was refused.
+recent_violations = collections.deque(maxlen=100)
+
+
+def _refuse(tenant, event, message):
+    recent_violations.append((tenant, event))
+    raise TenantNetworkViolation(message)
+
+
 def _hook(event, args):
     tenant = current_tenant.get()
     if tenant is None:
@@ -86,16 +97,15 @@ def _hook(event, args):
         sock = args[0]
         if sock in _control or sock in _brokered.get(tenant, ()):
             return
-        raise TenantNetworkViolation(
-            'tenant {0}: {1} on a socket not from its broker'.format(tenant, event))
+        _refuse(tenant, event, 'tenant {0}: {1} on a socket not from its broker'.format(
+            tenant, event))
     if event in _LOOKUP_EVENTS:
         if event == 'socket.getaddrinfo' and _is_literal(args[0]):
             return  # address literals are not looked up
-        raise TenantNetworkViolation(
-            'tenant {0}: {1} refused; resolve names through the broker'.format(tenant, event))
+        _refuse(tenant, event, 'tenant {0}: {1} refused; resolve names through the broker'.format(
+            tenant, event))
     if event in _PROCESS_EVENTS:
-        raise TenantNetworkViolation(
-            'tenant {0}: {1} refused'.format(tenant, event))
+        _refuse(tenant, event, 'tenant {0}: {1} refused'.format(tenant, event))
 
 
 class ContextThreadPoolExecutor(concurrent.futures.ThreadPoolExecutor):

@@ -41,6 +41,7 @@ import threading
 import weakref
 
 import aiohmi.util.netcontext as netcontext
+import aiohttp
 import aiohttp.abc
 
 import confluent.config.configmanager as configmanager
@@ -392,6 +393,102 @@ class TenantResolver(aiohttp.abc.AbstractResolver):
 
     async def close(self):
         pass
+
+
+def current_network():
+    """The current task's tenant network (a TenantNetworkRef), or None for
+    the default tenant."""
+    return netcontext.current_network.get()
+
+
+def _addresses_blocking(net, host, port):
+    family = _literal_family(host)
+    if family is not None:
+        return [(family, (host, port) if family == socket.AF_INET else (host, port, 0, 0))]
+    found = []
+    for family in (socket.AF_INET, socket.AF_INET6):
+        try:
+            for addr in net._net().resolve(host, _family_name(family)):
+                found.append((family, (addr, port) if family == socket.AF_INET
+                              else (addr, port, 0, 0)))
+        except BrokerError:
+            continue
+    if not found:
+        raise socket.gaierror(socket.EAI_NONAME, 'cannot resolve ' + host)
+    return found
+
+
+def connect_blocking(host, port, timeout=None, setup=None):
+    """For code that makes its own blocking TCP connections: a socket
+    connected to host:port through the current tenant's network, or None
+    for the default tenant (keep using the host network as before).
+    setup(sock) may adjust the socket before it connects."""
+    net = current_network()
+    if net is None:
+        return None
+    last = None
+    for family, sockaddr in _addresses_blocking(net, host, port):
+        sock = net.socket_factory((family, socket.SOCK_STREAM, 0, '', sockaddr))
+        sock.setblocking(True)
+        sock.settimeout(timeout)
+        if setup is not None:
+            setup(sock)
+        try:
+            sock.connect(sockaddr)
+            return sock
+        except OSError as e:
+            sock.close()
+            last = e
+    raise last or OSError('cannot connect to {0}'.format(host))
+
+
+async def aconnect(host, port, timeout=10):
+    """The asyncio form of connect_blocking: a connected, non-blocking
+    socket through the current tenant's network, or None for the default
+    tenant."""
+    net = current_network()
+    if net is None:
+        return None
+    loop = asyncio.get_running_loop()
+    last = None
+    for family, sockaddr in await net.getaddrinfo(host, port):
+        sock = net.socket_factory((family, socket.SOCK_STREAM, 0, '', sockaddr))
+        sock.setblocking(False)
+        try:
+            await asyncio.wait_for(loop.sock_connect(sock, sockaddr), timeout)
+            return sock
+        except (OSError, asyncio.TimeoutError) as e:
+            sock.close()
+            last = e
+    raise last or OSError('cannot connect to {0}'.format(host))
+
+
+def aiohttp_connector():
+    """For code that builds its own aiohttp.ClientSession: a connector using
+    the current tenant's network, or None for the default tenant (aiohttp's
+    default connector)."""
+    net = current_network()
+    if net is None:
+        return None
+    try:
+        return aiohttp.TCPConnector(socket_factory=net.socket_factory,
+                                    resolver=net.resolver())
+    except TypeError:
+        raise TenantNetworkUnsupported(
+            'reaching a tenant network over HTTPS needs aiohttp 3.12 or later')
+
+
+class TenantNetworkUnsupported(TenantNetworkError):
+    """This operation cannot yet be done within a tenant's network."""
+
+
+def refuse_for_tenant(what):
+    """Raise TenantNetworkUnsupported if the current task works for a
+    tenant: for code that cannot reach a tenant's network yet."""
+    net = current_network()
+    if net is not None:
+        raise TenantNetworkUnsupported(
+            '{0} is not yet available within a tenant'.format(what))
 
 
 def enter(tenantid):
