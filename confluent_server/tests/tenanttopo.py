@@ -138,6 +138,91 @@ open(ready, 'w').close()
 server.serve_forever()
 '''
 
+DHCP_CLIENT = r'''
+# A DHCP client on hw0: DISCOVER (optionally as a PXE client), and for a
+# plain client that is offered an address, REQUEST. Writes what it saw.
+# As a client without an address does, it sends from 0.0.0.0 (so by
+# packet socket) and takes the broadcast answers on port 68.
+import json, os, socket, struct, sys, time
+mac, mode, uuidhex, out, patience = sys.argv[1:6]
+chaddr = bytes.fromhex(mac.replace(':', ''))
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, b'hw0')
+s.bind(('', 68))
+raw = socket.socket(socket.AF_PACKET, socket.SOCK_DGRAM, socket.htons(0x0800))
+xid = os.urandom(4)
+def csum(data):
+    total = sum(struct.unpack('!%dH' % (len(data) // 2), data))
+    while total >> 16:
+        total = (total & 0xffff) + (total >> 16)
+    return ~total & 0xffff
+def send(options):
+    pkt = struct.pack('!BBBB4sHH', 1, 1, 6, 0, xid, 0, 0x8000) + bytes(16)
+    pkt += chaddr + bytes(10) + bytes(192) + bytes([99, 130, 83, 99])
+    pkt += options + bytes([255])
+    pkt += bytes(max(0, 300 - len(pkt)))
+    udp = struct.pack('!HHHH', 68, 67, 8 + len(pkt), 0) + pkt
+    ip = struct.pack('!BBHHHBBH4s4s', 0x45, 0, 20 + len(udp), 0, 0, 64, 17, 0,
+                     bytes(4), bytes([255] * 4))
+    ip = ip[:10] + struct.pack('!H', csum(ip)) + ip[12:]
+    raw.sendto(ip + udp, ('hw0', 0x0800, 0, 1, bytes([255] * 6)))
+def opt(code, value):
+    return bytes([code, len(value)]) + value
+def answer(kind, deadline):
+    while time.time() < deadline:
+        s.settimeout(max(0.05, deadline - time.time()))
+        try:
+            data = s.recv(4096)
+        except socket.timeout:
+            break
+        if len(data) < 240 or data[0] != 2 or data[4:8] != xid:
+            continue
+        options, idx = {}, 240
+        while idx < len(data) and data[idx] != 255:
+            options[data[idx]] = data[idx + 2:idx + 2 + data[idx + 1]]
+            idx += 2 + data[idx + 1]
+        if options.get(53) != bytes([kind]):
+            continue
+        return {'yiaddr': socket.inet_ntoa(data[16:20]),
+                'server': socket.inet_ntoa(options.get(54, bytes(4))),
+                'lease': struct.unpack('!I', options.get(51, bytes(4)))[0],
+                'netmask': socket.inet_ntoa(options.get(1, bytes(4))),
+                'gateway': socket.inet_ntoa(options.get(3, bytes(4))),
+                'vendor': options.get(60, b'').decode(),
+                'bootfile': data[108:236].rstrip(bytes(1)).decode()}
+    return None
+discover = opt(53, bytes([1]))
+if mode == 'pxe':
+    discover += opt(60, b'PXEClient:Arch:00007:UNDI:003016') + opt(93, bytes([0, 7]))
+    discover += opt(97, bytes(1) + bytes.fromhex(uuidhex))
+send(discover)
+result = {'offer': answer(2, time.time() + float(patience)), 'ack': None}
+if result['offer'] and mode == 'plain':
+    request = opt(53, bytes([3])) + opt(50, socket.inet_aton(result['offer']['yiaddr']))
+    request += opt(54, socket.inet_aton(result['offer']['server']))
+    send(request)
+    result['ack'] = answer(5, time.time() + float(patience))
+with open(out + '.tmp', 'w') as f:
+    json.dump(result, f)
+os.rename(out + '.tmp', out)
+'''
+
+SSDP_NOTIFY = r'''
+# One SSDP NOTIFY (a Redfish service coming up) from hw0, by multicast.
+import socket, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, b'hw0')
+s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(sys.argv[1]))
+s.sendto(b'\r\n'.join([
+    b'NOTIFY * HTTP/1.1', b'HOST: 239.255.255.250:1900',
+    b'NT: urn:dmtf-org:service:redfish-rest:1', b'NTS: ssdp:alive',
+    b'AL: https://' + sys.argv[1].encode() + b'/redfish/v1/',
+    b'LOCATION: https://' + sys.argv[1].encode() + b'/redfish/v1/', b'', b'']),
+    ('239.255.255.250', 1900))
+'''
+
 CLIENT = r'''
 import array, json, socket, struct, sys
 path = sys.argv[1]
@@ -251,6 +336,18 @@ class Topology(object):
         ready = os.path.join(self.dir, 'http-ready-' + tid)
         self.netns.spawn(self.lan[tid], sys.executable, '-c', HTTP, TENANTS[tid][0], ready)
         wait(lambda: os.path.exists(ready))
+
+    def dhcp_client(self, tid, mac, mode='plain', uuidhex='', patience=3):
+        """Start a DHCP client in the tenant's LAN; returns the file its
+        result (JSON) appears in when it is done."""
+        self._dhcp_runs = getattr(self, '_dhcp_runs', 0) + 1
+        out = os.path.join(self.dir, 'dhcp-%s-%d.json' % (tid, self._dhcp_runs))
+        self.netns.spawn(self.lan[tid], sys.executable, '-c', DHCP_CLIENT, mac,
+                         mode, uuidhex, out, str(patience))
+        return out
+
+    def ssdp_notify(self, tid):
+        self.netns.run(self.lan[tid], sys.executable, '-c', SSDP_NOTIFY, HW_IP)
 
     def socket_path(self, tid):
         return os.path.join(self.dir, tid, 'broker.sock')

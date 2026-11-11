@@ -17,6 +17,8 @@
 
 
 import asyncio
+import contextvars
+import ipaddress
 import confluent.exceptions as exc
 import codecs
 try:
@@ -92,6 +94,96 @@ def _is_global(fam, addr):
         return addr[0] != 127
     return addr != socket.inet_pton(socket.AF_INET6, '::1') and \
         not (addr[0] == 0xfe and addr[1] & 0xc0 == 0x80)
+
+
+# Sockets opened for a tenant's discovery listeners, so that stopping them
+# closes every socket they opened (see listener_scope).
+_listener_sockets = contextvars.ContextVar('listener_sockets', default=None)
+
+
+def listener_scope():
+    """Collect the tenant sockets the current task (and the tasks it
+    starts) open from here on; returns the list they are added to."""
+    opened = []
+    _listener_sockets.set(opened)
+    return opened
+
+
+def tenant_udp_socket(family, port=0, broadcast=False, pktinfo=False,
+                      reuseaddr=True):
+    """A UDP socket of the current tenant's network, from its broker
+    (bound to port, 0 for any)."""
+    net = _tenantnet().current_network()
+    sock = net.udp_socket(family, port=port, broadcast=broadcast,
+                          pktinfo=pktinfo, reuseaddr=reuseaddr)
+    opened = _listener_sockets.get()
+    if opened is not None:
+        opened[:] = [s for s in opened if s.fileno() != -1]
+        opened.append(sock)
+    return sock
+
+
+def tenant_packet_socket(ifname, ethertype, kind='raw'):
+    net = _tenantnet().current_network()
+    sock, ifindex = net.packet_socket(ifname, ethertype, kind)
+    opened = _listener_sockets.get()
+    if opened is not None:
+        opened.append(sock)
+    return sock
+
+
+def stream_socket(family):
+    """An unconnected TCP socket of the current task's network."""
+    net = _tenantnet().current_network()
+    if net is None:
+        return socket.socket(family, socket.SOCK_STREAM)
+    return net.socket_factory((family, socket.SOCK_STREAM, 0, '', None))
+
+
+def interface_indexes():
+    """util.list_interface_indexes for the current task's network."""
+    net = _tenantnet().current_network()
+    if net is None:
+        return list(util_list_interface_indexes())
+    return [iface['index'] for iface in net.list_interfaces()]
+
+
+def ipv4_interfaces():
+    """util.list_ips (address and broadcast of each IPv4 interface
+    address) for the current task's network."""
+    net = _tenantnet().current_network()
+    if net is None:
+        return list(util_list_ips())
+    found = []
+    for iface in net.list_interfaces():
+        for addr in iface.get('ipv4', []):
+            ifaddr = ipaddress.IPv4Interface(addr)
+            if ifaddr.ip.is_loopback:
+                continue
+            found.append({'addr': str(ifaddr.ip),
+                          'broadcast': str(ifaddr.network.broadcast_address)})
+    return found
+
+
+def interface_name(ifidx):
+    """The name of an interface of the current task's network."""
+    net = _tenantnet().current_network()
+    if net is None:
+        return socket.if_indextoname(ifidx)
+    for iface in net.list_interfaces():
+        if iface['index'] == ifidx:
+            return iface['name']
+    raise OSError('no interface with index {0}'.format(ifidx))
+
+
+def util_list_interface_indexes():
+    import confluent.util as util
+    return util.list_interface_indexes()
+
+
+def util_list_ips():
+    import confluent.util as util
+    return util.list_ips()
 
 
 async def _tenant_addresses(net, idx=0, family=0, matchlla=None):

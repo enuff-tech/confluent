@@ -179,9 +179,29 @@ async def get_ipaddr(hwaddr):
             ipaddr = ipbymac.get(hwaddrbytes, [])
     return ipaddr
 
+async def _tenant_hwaddr(net, ipaddr):
+    # the tenant's own neighbor table, through its broker
+    import confluent.netutil as netutil
+    hwaddr = await asyncio.get_running_loop().run_in_executor(
+        None, net.neighbor, ipaddr)
+    if hwaddr:
+        return hwaddr
+    family = socket.AF_INET6 if ':' in ipaddr else socket.AF_INET
+    ipn = socket.inet_pton(family, ipaddr)
+    if family == socket.AF_INET6 and ipn.startswith(b'\xfe\x80'):
+        return None  # link-local: a neighbor, not learned yet
+    if not await netutil.ipn_is_local(ipn):
+        return False
+    return None
+
+
 async def get_hwaddr(ipaddr):
     if '%' in ipaddr:
         ipaddr, _ = ipaddr.split('%', 1)
+    import aiohmi.util.netcontext as netcontext
+    net = netcontext.current_network.get()
+    if net is not None:
+        return await _tenant_hwaddr(net, ipaddr)
     hwaddr = None
     if os.name == 'nt':
         return hwaddr

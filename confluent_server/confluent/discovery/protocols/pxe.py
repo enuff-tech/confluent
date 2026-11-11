@@ -33,6 +33,8 @@ import confluent.log as log
 import confluent.netutil as netutil
 import confluent.util as util
 import confluent.tasks as tasks
+import confluent.tenantstate as tenantstate
+import aiohmi.util.netcontext as netcontext
 import ctypes
 import ctypes.util
 try:
@@ -51,8 +53,14 @@ libc = ctypes.CDLL(ctypes.util.find_library('c'))
 iphdr = b'\x45\x00\x00\x00\x00\x00\x00\x00\x40\x11\x00\x00\x00\x00\x00\x00\xff\xff\xff\xff'
 constiphdrsum = b'\x85\x11'
 udphdr = b'\x00\x43\x00\x44\x00\x00\x00\x00'
-ignoremacs = {}
-ignoredisco = {}
+# Kept per tenant: each tenant's PXE/DHCP traffic is its own.
+ignoremacs = tenantstate.TenantScoped()
+ignoredisco = tenantstate.TenantScoped()
+
+
+def _tenant_net():
+    """The current task's tenant network, None for the host's."""
+    return netcontext.current_network.get()
 
 mcastv6addr = 'ff02::1:2'
 
@@ -104,6 +112,8 @@ def idxtoname(idx):
 
 _idxtobcast = {}
 def get_bcastaddr(idx):
+    if _tenant_net() is not None:
+        return bytearray(b'\xff' * 6)  # tenant networks are Ethernet
     if idx not in _idxtobcast:
         if psutil:
             for addr in psutil.net_if_addrs()[idxtoname(idx)]:
@@ -145,9 +155,11 @@ def register_shorturl(url, can302=True, relurl=None, filename=None):
     return returl
 
 
-uuidmap = {}
-macmap = {}
+uuidmap = tenantstate.TenantScoped()
+macmap = tenantstate.TenantScoped()
 attribwatcher = None
+_tenant_attribwatchers = {}
+_tenant_nodewatchers = {}
 
 def stringify(value):
     string = bytes(value)
@@ -419,8 +431,48 @@ def new_dhcp6_packet(handler, net6, cfg, nodeguess):
         tasks.spawn(process_dhcp6req(handler, rqv, addr, net6, cfg, nodeguess))
 
 
+async def _tenant_snoop(handler, nodeguess, tenant):
+    """DHCP within a tenant's network, on sockets from its broker.
+
+    The tenant's DHCP and DHCPv6 traffic is detected and, as configured on
+    its nodes (net.ipv4_method, net.lease_time), answered with their
+    static addresses; nodes set to dhcp are left to the tenant's own DHCP
+    service. Network boot (proxyDHCP, boot files) is not offered yet.
+    """
+    global tracelog
+    tracelog = log.Logger('trace')
+    cfg = cfm.ConfigManager(tenant)
+    # listening again (autosense, tenant state): not a second set of watchers
+    for watchers in (_tenant_attribwatchers, _tenant_nodewatchers):
+        if tenant in watchers:
+            try:
+                cfg.remove_watcher(watchers.pop(tenant))
+            except Exception:
+                pass
+    remap_nodes(cfg.list_nodes(), cfg)
+    _tenant_attribwatchers[tenant] = cfg.watch_attributes(
+        cfg.list_nodes(), ('id.uuid', 'net.*hwaddr'), remap_nodes)
+    _tenant_nodewatchers[tenant] = cfg.watch_nodecollection(new_nodes)
+    net4 = netutil.tenant_udp_socket(socket.AF_INET, 67, broadcast=True,
+                                     pktinfo=True)
+    net6 = netutil.tenant_udp_socket(socket.AF_INET6, 547)
+    v6addr = socket.inet_pton(socket.AF_INET6, mcastv6addr)
+    for ifidx in netutil.interface_indexes():
+        try:
+            net6.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_JOIN_GROUP,
+                            v6addr + struct.pack('=I', ifidx))
+        except socket.error:
+            pass  # interfaces without IPv6 (or multicast)
+    cloop = asyncio.get_running_loop()
+    cloop.add_reader(net4, new_dhcp_packet, handler, nodeguess, cfg, net4)
+    cloop.add_reader(net6, new_dhcp6_packet, handler, net6, cfg, nodeguess)
+
+
 async def snoop(handler, protocol=None, nodeguess=None):
     global ignorenics
+    net = _tenant_net()
+    if net is not None:
+        return await _tenant_snoop(handler, nodeguess, net.tenant)
     #TODO(jjohnson2): ipv6 socket and multicast for DHCPv6, should that be
     #prominent
     #TODO(jjohnson2): enable unicast replies. This would suggest either
@@ -462,7 +514,7 @@ async def snoop(handler, protocol=None, nodeguess=None):
     cloop.add_reader(net6, new_dhcp6_packet, handler, net6, cfg, nodeguess)
 
 
-_mac_to_uuidmap = {}
+_mac_to_uuidmap = tenantstate.TenantScoped()
 
 
 async def process_dhcp6req(handler, rqv, addr, net, cfg, nodeguess):
@@ -537,40 +589,52 @@ async def process_dhcp4req(handler, nodeguess, cfg, net4, idx, recv, rqv, client
 
 
 
-def clear_nodes(nodes):
+def clear_nodes(nodes, tenant=None):
+    # the maps of the tenant whose configuration changed
+    tmacmap = macmap.for_tenant(tenant)
+    tuuidmap = uuidmap.for_tenant(tenant)
     for nodename in nodes:
-        for ent in list(macmap):
-            if macmap[ent] == nodename:
-                del macmap[ent]
-        for ent in list(uuidmap):
-            if uuidmap[ent] == nodename:
-                del uuidmap[ent]
+        for ent in list(tmacmap):
+            if tmacmap[ent] == nodename:
+                del tmacmap[ent]
+        for ent in list(tuuidmap):
+            if tuuidmap[ent] == nodename:
+                del tuuidmap[ent]
 
 
 def new_nodes(added, deleting, renamed, configmanager):
     global attribwatcher
-    configmanager.remove_watcher(attribwatcher)
+    tenant = configmanager.tenant
+    if tenant is None:
+        configmanager.remove_watcher(attribwatcher)
+    else:
+        configmanager.remove_watcher(_tenant_attribwatchers.get(tenant))
     alldeleting = set(deleting) | set(renamed)
-    clear_nodes(alldeleting)
+    clear_nodes(alldeleting, tenant)
     alladding = set(added)
     for oldname in renamed:
         alladding.add(renamed[oldname])
     remap_nodes(alladding, configmanager)
-    attribwatcher = configmanager.watch_attributes(configmanager.list_nodes(),
-                                                   ('id.uuid', 'net.*hwaddr'), remap_nodes)
+    watcher = configmanager.watch_attributes(configmanager.list_nodes(),
+                                             ('id.uuid', 'net.*hwaddr'), remap_nodes)
+    if tenant is None:
+        attribwatcher = watcher
+    else:
+        _tenant_attribwatchers[tenant] = watcher
 
 
 def remap_nodes(nodeattribs, configmanager):
-    global macmap
-    global uuidmap
+    tenant = configmanager.tenant
     updates = configmanager.get_node_attributes(nodeattribs, ('id.uuid', 'net.*hwaddr'))
-    clear_nodes(nodeattribs)
+    clear_nodes(nodeattribs, tenant)
+    tmacmap = macmap.for_tenant(tenant)
+    tuuidmap = uuidmap.for_tenant(tenant)
     for node in updates:
         for attrib in updates[node]:
             if attrib == 'id.uuid':
-                uuidmap[updates[node][attrib]['value'].lower()] = node
+                tuuidmap[updates[node][attrib]['value'].lower()] = node
             elif 'hwaddr' in attrib:
-                macmap[updates[node][attrib]['value'].lower()] = node
+                tmacmap[updates[node][attrib]['value'].lower()] = node
 
 
 def get_deployment_profile(node, cfg, cfd=None):
@@ -589,8 +653,8 @@ def get_deployment_profile(node, cfg, cfd=None):
                 return None, None
     return profile, stgprofile
 
-staticassigns = {}
-myipbypeer = {}
+staticassigns = tenantstate.TenantScoped()
+myipbypeer = tenantstate.TenantScoped()
 async def check_reply(node, info, packet, sock, cfg, reqview, addr, requestor):
     if not requestor:
         requestor = ('0.0.0.0', None)
@@ -625,6 +689,8 @@ async def check_reply(node, info, packet, sock, cfg, reqview, addr, requestor):
         return await reply_dhcp4(node, info, packet, cfg, reqview, httpboot, cfd, profile, sock, requestor, niccfg=niccfg)
 
 async def reply_dhcp6(node, addr, cfg, packet, cfd, profile, sock, niccfg=None):
+    if _tenant_net() is not None:
+        return  # an HTTP boot offer: deployment is not in tenant networks yet
     myaddrs = await netutil.get_my_addresses(addr[-1], socket.AF_INET6)
     if not myaddrs:
         log.log({'info': 'Unable to provide IPv6 boot services to {0}, no viable IPv6 configuration on interface index "{1}" to respond through.'.format(node, addr[-1])})
@@ -708,7 +774,7 @@ def get_my_duid():
         _myuuid = uuid.uuid4().bytes
     return _myuuid
 
-_recent_txids = {}
+_recent_txids = tenantstate.TenantScoped()
 
 async def reply_dhcp4(node, info, packet, cfg, reqview, httpboot, cfd, profile, sock=None, requestor=None, niccfg=None, broadcast=True):
     replen = 256 # 275  # default is going to be 286
@@ -721,6 +787,15 @@ async def reply_dhcp4(node, info, packet, cfg, reqview, httpboot, cfd, profile, 
     if info.get('architecture', None) is None:
         isboot = False
     rqtype = packet[53][0]
+    if isboot and _tenant_net() is not None:
+        # Boot offers point at deployment services, which tenant networks
+        # do not have yet. Addresses are still assigned to nodes that ask
+        # with plain DHCP.
+        if rqtype == 1 and time.time() > ignoremacs.get(info['hwaddr'], 0) + 90:
+            ignoremacs[info['hwaddr']] = time.time()
+            log.log({'info': 'Network boot attempt by {0} within a tenant; '
+                             'network boot is not yet available to tenants'.format(node)})
+        return
     if isboot:
         insecuremode = cfd.get(node, {}).get('deployment.useinsecureprotocols',
             {}).get('value', 'never')
@@ -958,8 +1033,14 @@ async def send_rsp(repview, replen, requestor, relayip, reqview, info, defertxid
 
 def send_raw_packet(repview, replen, reqview, info):
     ifidx = info['netinfo']['ifidx']
-    tsock = socket.socket(socket.AF_PACKET, socket.SOCK_DGRAM,
-                          socket.htons(0x800))
+    net = _tenant_net()
+    if net is not None:
+        # a packet socket of the tenant's network, bound to the interface
+        # the request came in on
+        tsock = net.packet_socket(netutil.interface_name(ifidx), 0x800, 'dgram')[0]
+    else:
+        tsock = socket.socket(socket.AF_PACKET, socket.SOCK_DGRAM,
+                              socket.htons(0x800))
     targ = sockaddr_ll()
     bcastaddr = get_bcastaddr(ifidx)
     hwlen = len(bcastaddr)
@@ -976,8 +1057,11 @@ def send_raw_packet(repview, replen, reqview, info):
         # Python 2....
         pkt = ctypes.byref((ctypes.c_char * (replen)).from_buffer_copy(
             repview[:replen].tobytes()))
-    sendto(tsock.fileno(), pkt, replen, 0, ctypes.byref(targ),
-           ctypes.sizeof(targ))
+    try:
+        sendto(tsock.fileno(), pkt, replen, 0, ctypes.byref(targ),
+               ctypes.sizeof(targ))
+    finally:
+        tsock.close()
 
 
 async def ack_request_full(pkt, rq, info, sock, requestor, hwaddr, addr):
