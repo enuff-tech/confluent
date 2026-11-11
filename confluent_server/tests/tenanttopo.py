@@ -26,6 +26,7 @@ access to the source tree.
 """
 
 import datetime
+import json
 import os
 import shutil
 import sys
@@ -223,6 +224,110 @@ s.sendto(b'\r\n'.join([
     ('239.255.255.250', 1900))
 '''
 
+SNMP_AGENT = r'''
+# A switch's SNMP agent (v2c: get, getnext, getbulk) on port 161. It
+# answers only its own community string, from the table it is given, and
+# records the community strings it was asked with.
+import json, socket, sys
+community, datafile, seen, ready = sys.argv[1:5]
+def enc_len(n):
+    if n < 128:
+        return bytes([n])
+    raw = n.to_bytes((n.bit_length() + 7) // 8, 'big')
+    return bytes([0x80 | len(raw)]) + raw
+def tlv(tag, body):
+    return bytes([tag]) + enc_len(len(body)) + body
+def enc_int(n):
+    return tlv(2, n.to_bytes(n.bit_length() // 8 + 1, 'big', signed=True))
+def enc_oid(oid):
+    body = bytearray([oid[0] * 40 + oid[1]])
+    for arc in oid[2:]:
+        chunk = [arc & 0x7f]
+        arc >>= 7
+        while arc:
+            chunk.insert(0, 0x80 | (arc & 0x7f))
+            arc >>= 7
+        body += bytes(chunk)
+    return tlv(6, bytes(body))
+def dec(data, pos):
+    tag, n = data[pos], data[pos + 1]
+    pos += 2
+    if n & 0x80:
+        size = n & 0x7f
+        n = int.from_bytes(data[pos:pos + size], 'big')
+        pos += size
+    return tag, data[pos:pos + n], pos + n
+def dec_oid(body):
+    oid, arc = [body[0] // 40, body[0] % 40], 0
+    for b in body[1:]:
+        arc = (arc << 7) | (b & 0x7f)
+        if not b & 0x80:
+            oid.append(arc)
+            arc = 0
+    return tuple(oid)
+def enc_value(value):
+    kind, value = value
+    if kind == 'i':
+        return enc_int(value)
+    if kind == 'o':
+        return enc_oid(tuple(int(x) for x in value.split('.')))
+    if kind == 'x':
+        return tlv(4, bytes.fromhex(value))
+    return tlv(4, value.encode())
+with open(datafile) as f:
+    table = sorted((tuple(int(x) for x in k.split('.')), v) for k, v in json.load(f).items())
+def after(oid):
+    for candidate, value in table:
+        if candidate > oid:
+            return candidate, enc_value(value)
+    return oid, bytes([0x82, 0])  # endOfMibView
+def exact(oid):
+    for candidate, value in table:
+        if candidate == oid:
+            return oid, enc_value(value)
+    return oid, bytes([0x81, 0])  # noSuchInstance
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.bind(('0.0.0.0', 161))
+open(ready, 'w').close()
+while True:
+    data, peer = s.recvfrom(65535)
+    try:
+        _, msg, _ = dec(data, 0)
+        _, version, pos = dec(msg, 0)
+        _, asked, pos = dec(msg, pos)
+        kind, pdu, _ = dec(msg, pos)
+        with open(seen, 'a') as f:
+            f.write(asked.decode() + '\n')
+        if asked.decode() != community:
+            continue
+        _, reqid, pos = dec(pdu, 0)
+        _, first, pos = dec(pdu, pos)
+        _, second, pos = dec(pdu, pos)
+        _, binds, _ = dec(pdu, pos)
+        oids, pos = [], 0
+        while pos < len(binds):
+            _, bind, pos = dec(binds, pos)
+            oids.append(dec_oid(dec(bind, 0)[1]))
+        answers = []
+        if kind == 0xa0:
+            answers = [exact(oid) for oid in oids]
+        elif kind == 0xa1:
+            answers = [after(oid) for oid in oids]
+        elif kind == 0xa5:
+            skip = int.from_bytes(first, 'big')
+            answers = [after(oid) for oid in oids[:skip]]
+            current = oids[skip:]
+            for _ in range(int.from_bytes(second, 'big')):
+                current = [after(oid) for oid in current]
+                answers += current
+                current = [oid for oid, _ in current]
+        body = b''.join(tlv(0x30, enc_oid(oid) + value) for oid, value in answers)
+        rsp = tlv(2, reqid) + enc_int(0) + enc_int(0) + tlv(0x30, body)
+        s.sendto(tlv(0x30, tlv(2, version) + tlv(4, asked) + tlv(0xa2, rsp)), peer)
+    except Exception:
+        continue
+'''
+
 CLIENT = r'''
 import array, json, socket, struct, sys
 path = sys.argv[1]
@@ -292,6 +397,7 @@ class Topology(object):
             with open(os.path.join(etc, 'hosts'), 'w') as f:
                 f.write('127.0.0.1 localhost\n%s bmc-a\n' % (
                     '10.241.34.2' if label == 't1-hw' else '10.241.34.99'))
+                f.write('%s sw1\n' % HW_IP)  # every tenant has a switch sw1
             os.makedirs(os.path.join(self.dir, tid))
             os.chmod(os.path.join(self.dir, tid), 0o777)
         self.decoy = netns.create()
@@ -348,6 +454,21 @@ class Topology(object):
 
     def ssdp_notify(self, tid):
         self.netns.run(self.lan[tid], sys.executable, '-c', SSDP_NOTIFY, HW_IP)
+
+    def start_snmp(self, tid, community, table):
+        """A switch's SNMP agent at HW_IP:161 in the tenant's LAN, with
+        the given table ({oid: [kind, value]}); returns the file listing
+        the community strings it is asked with."""
+        data = os.path.join(self.dir, 'snmp-%s.json' % tid)
+        seen = os.path.join(self.dir, 'snmp-%s.seen' % tid)
+        ready = os.path.join(self.dir, 'snmp-ready-' + tid)
+        with open(data, 'w') as f:
+            json.dump(table, f)
+        open(seen, 'w').close()
+        self.netns.spawn(self.lan[tid], sys.executable, '-c', SNMP_AGENT,
+                         community, data, seen, ready)
+        wait(lambda: os.path.exists(ready))
+        return seen
 
     def socket_path(self, tid):
         return os.path.join(self.dir, tid, 'broker.sock')

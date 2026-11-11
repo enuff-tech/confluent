@@ -30,9 +30,13 @@ def in_tenant():
     tenantnet.enter(None)
 
 
-async def test_snmp_is_refused_for_tenants(in_tenant):
-    with pytest.raises(tenantnet.TenantNetworkUnsupported):
-        await snmputil._get_transport('10.241.34.2')
+async def test_snmp_uses_the_tenants_network_or_nothing(in_tenant):
+    # the target sends through a socket of the tenant's network; this
+    # tenant has none, so opening it fails rather than use the host's
+    transport = await snmputil._get_transport('10.241.34.2')
+    assert type(transport).__name__ == 'TenantTransportTarget'
+    with pytest.raises(tenantnet.TenantNetworkError):
+        transport.open_client_mode()
 
 
 async def test_snmp_still_works_without_a_tenant():

@@ -25,13 +25,16 @@
 # service should have a null tenant and a tenant entry that correlates)
 __author__ = 'jjohnson2'
 
-import asyncio
 import confluent.config.configmanager as configmanager
+import confluent.netutil as netutil
+import confluent.tenantstate as tenantstate
 import itertools
 
-manager_to_nodemap = {}
+# hints, per tenant: the same manager address is a different node in
+# another tenant
+manager_to_nodemap = tenantstate.TenantScoped()
 
-async def node_by_manager(manager):
+async def node_by_manager(manager, cfm=None):
     """Lookup a node by manager
 
     Search for a node according to a given network address.
@@ -41,15 +44,21 @@ async def node_by_manager(manager):
     '127.000.000.001' will match '127.0.0.1'
 
     :param manager: The ip or resolvable name of the manager
+    :param cfm: The configuration to search (a tenant's own nodes, when
+                the request is a tenant's); the default tenant's if omitted
 
     :returns: The node name (if any)
     """
 
     manageraddresses = []
-    for tmpaddr in await asyncio.get_running_loop().getaddrinfo(manager, None):
+    for tmpaddr in await netutil._getaddrinfo(manager, None):
         manageraddresses.append(tmpaddr[4][0])
-    cfm = configmanager.ConfigManager(None)
-    if manager in manager_to_nodemap:
+    if cfm is None:
+        cfm = configmanager.ConfigManager(None)
+    hints = manager_to_nodemap.for_tenant(cfm.tenant)
+    if hints.get(manager) is not None and not cfm.is_node(hints[manager]):
+        del hints[manager]
+    if manager in hints:
         # We have a stored hint as to the most probably correct answer
         # put that node at the head of the list in hopes of reducing
         # iterations for a lookup in a large environment
@@ -57,19 +66,25 @@ async def node_by_manager(manager):
         # reconfiguration could have changed it and this mapping
         # is not hooked into getting updates
         check_nodes = itertools.chain(
-            (manager_to_nodemap[manager],), cfm.list_nodes())
+            (hints[manager],), cfm.list_nodes())
     else:
         check_nodes = cfm.list_nodes()
     hmattribs = cfm.get_node_attributes(check_nodes,
                                         ('hardwaremanagement.manager',))
     for node in hmattribs:
-        currhm = hmattribs[node]['hardwaremanagement.manager']['value']
+        currhm = hmattribs[node].get('hardwaremanagement.manager', {}).get('value')
+        if not currhm:
+            continue
         currhm = currhm.split('/', 1)[0]
         if currhm in manageraddresses:
-            manager_to_nodemap[manager] = node
+            hints[manager] = node
             return node
-        for curraddr in await asyncio.get_running_loop().getaddrinfo(currhm, None):
+        try:
+            curraddrs = await netutil._getaddrinfo(currhm, None)
+        except OSError:
+            continue  # a manager that does not resolve is not this one
+        for curraddr in curraddrs:
             curraddr = curraddr[4][0]
             if curraddr in manageraddresses:
-                manager_to_nodemap[manager] = node
+                hints[manager] = node
                 return node
