@@ -16,6 +16,7 @@
 """This represents the low layer message framing portion of IPMI"""
 
 import collections
+import contextvars
 import hashlib
 import hmac
 import operator
@@ -33,6 +34,7 @@ from cryptography.hazmat.primitives.ciphers import modes
 
 import aiohmi.exceptions as exc
 from aiohmi.ipmi.private import constants
+from aiohmi.util import netcontext
 from aiohmi.ipmi.private.util import _monotonic_time
 from aiohmi.ipmi.private.util import get_ipmi_error
 
@@ -85,12 +87,54 @@ def unmatched(response, netfn, cmd):
 
 sockwatching = True
 
+# Wakes the socket watcher. A local socket pair rather than a datagram to
+# ourselves: it works whatever network the shared sockets belong to.
+_wakeup = None
+
+
+def _ensure_wakeup():
+    global _wakeup
+    if _wakeup is None:
+        _wakeup = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
+        for end in _wakeup:
+            end.setblocking(False)
+        iosockets.append(_wakeup[0])
+
+
+def _wake():
+    if _wakeup is not None:
+        try:
+            _wakeup[1].send(b'\x01')
+        except OSError:
+            pass  # already a wakeup pending
+
+
+def _netkey(net):
+    """Sessions and sockets of different networks are never shared."""
+    return None if net is None else net.key
+
+
+async def _resolve(host, port, net=None):
+    """(family, sockaddr) candidates for a BMC. On the host's own network
+    IPv4 addresses are mapped to IPv6 when the shared sockets are IPv6; a
+    given network resolves within itself and keeps the address family."""
+    if net is not None:
+        return list(await net.getaddrinfo(host, port))
+    loop = asyncio.get_running_loop()
+    result = []
+    for res in await loop.getaddrinfo(host, port, type=socket.SOCK_DGRAM):
+        sockaddr = res[4]
+        if ipv6support and res[0] == socket.AF_INET:
+            sockaddr = ('::ffff:' + sockaddr[0], sockaddr[1], 0, 0)
+        result.append((res[0], sockaddr))
+    return result
+
+
 async def terminate():
     global sockwatching
     await Session._cleanup()
     sockwatching = False
-    iosockets[0].sendto(
-                b'\x01', (myself, iosockets[0].getsockname()[1]))
+    _wake()
 
 def sock_completion(cloop, currsock, fut):
     cloop.remove_reader(currsock)
@@ -113,7 +157,13 @@ async def watchsockets():
             timeout = 0
         selectdeadline = _monotonic_time() + timeout
         currfutures = []
-        for currsock in iosockets:
+        for currsock in list(iosockets):
+            if currsock.fileno() < 0:
+                # Closed by its owner (a network that went away): forget it.
+                iosockets.remove(currsock)
+                Session.socketpool.pop(currsock, None)
+                Session.socketnet.pop(currsock, None)
+                continue
             currfut = asyncio.Future()
             asyncio.get_running_loop().add_reader(currsock, sock_completion, asyncio.get_running_loop(), currsock, currfut)
             currfutures.append(currfut)
@@ -180,7 +230,7 @@ async def _io_wait(timeout, myaddr=None, evq=None):
     deadline = timeout + _monotonic_time()
     ioqueue.append((deadline, evt, myaddr))
     if deadline < selectdeadline:
-        iosockets[0].sendto(b'\x01', (myself, iosockets[0].getsockname()[1]))
+        _wake()
     await evt.wait()
 
 
@@ -205,14 +255,16 @@ def _io_graball(mysockets, iowaiters):
             # into the select
             if len(rdata[0]) < 4:
                 continue
-            myport = mysocket.getsockname()[1]
             rdata = rdata + (mysocket,)
             relsession = None
+            # Sessions are found by the socket that received the packet, not
+            # its port: sockets of different networks may share a port
+            # number, and talk to BMCs that share an address.
             if (rdata[1] in Session.bmc_handlers
-                    and myport in Session.bmc_handlers[rdata[1]]):
+                    and mysocket in Session.bmc_handlers[rdata[1]]):
                 # session data
                 rdata = rdata + (True,)
-                relsession = Session.bmc_handlers[rdata[1]][myport]
+                relsession = Session.bmc_handlers[rdata[1]][mysocket]
             elif rdata[2] in Session.bmc_handlers:
                 # aiohmi is the bmc, and we have sessionless data
                 rdata = rdata + (False,)
@@ -320,6 +372,8 @@ class Session(object):
     # NOTE(jbjohnso):
     # socketpool is a mapping of sockets to usage count
     socketpool = {}
+    # socketnet maps each socket to the (network key, family) it belongs to
+    socketnet = {}
     # this will be a lock.  Delay the assignment so that a calling framework
     # can do something like reassign our threading and select modules
     socketchecking = None
@@ -337,7 +391,8 @@ class Session(object):
                 await session.logout(False)
 
     @classmethod
-    async def _assignsocket(cls, server=None, forbiddensockets=()):
+    async def _assignsocket(cls, server=None, forbiddensockets=(), net=None,
+                            family=None):
         global iothread
         global iothreadready
         global iosockets
@@ -346,11 +401,15 @@ class Session(object):
 
         # seek for the least used socket.  As sessions close, they may free
         # up slots in seemingly 'full' sockets.  This scheme allows those
-        # slots to be recycled
+        # slots to be recycled. Only sockets of the caller's own network are
+        # candidates.
+        netkey = _netkey(net)
         sorted_candidates = None
         if server is None:
-            sorted_candidates = sorted(dictitems(cls.socketpool),
-                                       key=operator.itemgetter(1))
+            sorted_candidates = sorted(
+                [c for c in dictitems(cls.socketpool)
+                 if cls.socketnet.get(c[0]) == (netkey, family if net else None)],
+                key=operator.itemgetter(1))
         if sorted_candidates is None:
             sorted_candidates = []
         for candidate in sorted_candidates:
@@ -361,7 +420,12 @@ class Session(object):
             cls.socketpool[candidate[0]] += 1
             return candidate[0]
         # we need a new socket
-        if server:
+        _ensure_wakeup()
+        if net is not None and server is None:
+            # A socket of the given network (already bound), made by whoever
+            # provides that network.
+            tmpsocket = net.udp_socket(family)
+        elif server:
             # Regardless of whether ipv6 is supported or not, we
             # must try to honor the address format of the given
             # server, rather than trying to create an automatic one
@@ -385,28 +449,24 @@ class Session(object):
         try:
             tmpsocket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 16777216)
         except Exception:
-            pass        
-        if server is None:
+            pass
+        if net is not None and server is None:
+            pass  # bound by its provider
+        elif server is None:
             # Rather than wait until send() to bind, bind now so that we have
             # a port number allocated no matter what
             tmpsocket.bind(('', 0))
         else:
             tmpsocket.bind(server[4])
         iosockets.append(tmpsocket)
-        if myself is None:
-            # we have confirmed kernel IPv6 support, but ::1 may still not
-            # be there
-            try:
-                iosockets[0].sendto(
-                    b'\x01', ('::1', iosockets[0].getsockname()[1]))
-                myself = '::1'
-            except socket.error:
-                # AF_INET6, but no '::1', try the AF_INET6 version of 127
-                myself = '::ffff:127.0.0.1'
+        cls.socketnet[tmpsocket] = (netkey, family if net else None)
         if iothread is None:
             initevt = asyncio.Event()
             iothreadwaiters.append(initevt)
-            iothread = asyncio.get_running_loop().create_task(watchsockets())
+            # The shared watcher serves every caller, so it must not carry
+            # whatever context its first caller happened to run in.
+            loop = asyncio.get_running_loop()
+            iothread = contextvars.Context().run(loop.create_task, watchsockets())
             await initevt.wait()
         elif not iothreadready:
             initevt = asyncio.Event()
@@ -465,22 +525,26 @@ class Session(object):
                 port=623,
                 kg=None,
                 privlevel=None,
-                keepalive=True):
+                keepalive=True,
+                net=None):
+        """net, when given, is the network to reach the BMC through: it has
+        a hashable .key, .udp_socket(family) returning a bound UDP socket of
+        that network, and async .getaddrinfo(host, port) returning
+        (family, sockaddr) pairs resolved within it. Sessions of different
+        networks are never shared, even for identical addresses and
+        credentials."""
         trueself = None
         forbidsock = []
+        net = netcontext.resolve(net)
+        netkey = _netkey(net)
         sesskey = (bmc, _credkey(userid), _credkey(password), port,
-                   _credkey(kg))
-        loop = asyncio.get_running_loop()
-        addrinfos = await loop.getaddrinfo(bmc, port, type=socket.SOCK_DGRAM)
-        for res in addrinfos:
-            sockaddr = res[4]
-            if ipv6support and res[0] == socket.AF_INET:
-                # convert the sockaddr to AF_INET6
-                newhost = '::ffff:' + sockaddr[0]
-                sockaddr = (newhost, sockaddr[1], 0, 0)
+                   _credkey(kg), netkey)
+        for family, sockaddr in await _resolve(bmc, port, net):
             if sockaddr in cls.bmc_handlers:
                 for portself in list(dictitems(cls.bmc_handlers[sockaddr])):
                     self = portself[1]
+                    if getattr(self, 'netkey', None) != netkey:
+                        continue  # same address, another network
                     if not ((self.logged or self.logging)
                             and await cls._is_session_valid(self)):
                         # we have encountered a leftover broken session
@@ -517,7 +581,8 @@ class Session(object):
             cls.initting_sessions[sesskey] = self
             try:
                 await self.__init__(
-                    bmc, userid, password, port, kg, privlevel, keepalive)
+                    bmc, userid, password, port, kg, privlevel, keepalive,
+                    net=net, family=family)
             finally:
                 # The only removal, and it has to happen whether the login
                 # worked or not, or the entry outlives the session
@@ -531,7 +596,12 @@ class Session(object):
                  port=623,
                  kg=None,
                  privlevel=None,
-                 keepalive=True):
+                 keepalive=True,
+                 net=None,
+                 family=None):
+        self.net = net
+        self.netkey = _netkey(net)
+        self.netfamily = family
         self.awaitingresponse = False
         self.lastresponse = None
         self.atomicop = asyncio.Lock()
@@ -593,7 +663,9 @@ class Session(object):
             self.__class__.socketchecking = asyncio.Lock()
         await self.socketchecking.acquire()
         try:
-            self.socket = await self._assignsocket(forbiddensockets=self.forbidsock)
+            self.socket = await self._assignsocket(
+                forbiddensockets=self.forbidsock, net=self.net,
+                family=self.netfamily)
             self._socketclaimed = True
         finally:
             self.socketchecking.release()
@@ -1637,6 +1709,13 @@ class Session(object):
             await self.onlogon({'error': errstr})
             return -9
         self.allowedpriv = data[2]
+        # The BMC chooses the algorithms (open session response, table
+        # 13-10): when it answers a SHA-256 request with RAKP-HMAC-SHA1,
+        # follow that rather than fail on the shorter keyed hash later.
+        if self.attemptedhash == 256 and len(data) > 16 and data[16] == 1:
+            self.attemptedhash = 1
+            self.currhashlib = hashlib.sha1
+            self.currhashlen = 12
         # NOTE(jbjohnso): At this point, the BMC has no idea about what user
         # shall be used.  As such, the allowedpriv field is actually
         # not particularly useful.  got_rakp2 is a good place to
@@ -1960,22 +2039,14 @@ class Session(object):
             # he have not yet picked a working sockaddr for this connection,
             # try all the candidates that getaddrinfo provides
             self.allsockaddrs = []
-            myport = self.socket.getsockname()[1]
             try:
-                loop = asyncio.get_running_loop()
-                addrinfo = await loop.getaddrinfo(self.bmc,
-                                                   self.port,
-                                                   type=socket.SOCK_DGRAM)
-                for res in addrinfo:
-                    sockaddr = res[4]
-                    if ipv6support and res[0] == socket.AF_INET:
-                        # convert the sockaddr to AF_INET6
-                        newhost = '::ffff:' + sockaddr[0]
-                        sockaddr = (newhost, sockaddr[1], 0, 0)
+                for family, sockaddr in await _resolve(self.bmc, self.port, self.net):
+                    if self.net is not None and family != self.netfamily:
+                        continue  # this session's socket has one family
                     self.allsockaddrs.append(sockaddr)
                     if sockaddr not in Session.bmc_handlers:
                         Session.bmc_handlers[sockaddr] = {}
-                    Session.bmc_handlers[sockaddr][myport] = self
+                    Session.bmc_handlers[sockaddr][self.socket] = self
                     _io_sendto(self.socket, self.netpacket, sockaddr)
             except socket.gaierror:
                 raise exc.IpmiException(
@@ -2051,11 +2122,10 @@ class Session(object):
             # since this session is broken, remove it from the handler list
             # This allows constructor to create a new, functional object to
             # replace this one
-            myport = self.socket.getsockname()[1]
             for sockaddr in self.allsockaddrs:
                 if (sockaddr in Session.bmc_handlers
-                        and myport in Session.bmc_handlers[sockaddr]):
-                    del Session.bmc_handlers[sockaddr][myport]
+                        and self.socket in Session.bmc_handlers[sockaddr]):
+                    del Session.bmc_handlers[sockaddr][self.socket]
                     if Session.bmc_handlers[sockaddr] == {}:
                         del Session.bmc_handlers[sockaddr]
         self.nowait = False

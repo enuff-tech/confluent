@@ -83,9 +83,9 @@ class ServerSession(ipmisession.Session):
         self.pendingpayloads = collections.deque([])
         self.pktqueue = collections.deque([])
         if clientaddr not in ipmisession.Session.bmc_handlers:
-            ipmisession.Session.bmc_handlers[clientaddr] = {bmc.port: self}
+            ipmisession.Session.bmc_handlers[clientaddr] = {netsocket: self}
         else:
-            ipmisession.Session.bmc_handlers[clientaddr][bmc.port] = self
+            ipmisession.Session.bmc_handlers[clientaddr][netsocket] = self
         self.initrequest = request
 
     async def send_open_session_response(self):

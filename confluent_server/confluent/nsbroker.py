@@ -198,6 +198,15 @@ def op_connect_tcp(ctx, args):
     return {}, sock
 
 
+def op_tcp_socket(ctx, args):
+    """An unconnected TCP socket of this namespace; the service connects it
+    itself (within this namespace, as the socket belongs to it)."""
+    _args(args, ('family',))
+    sock = socket.socket(_family(args['family']), socket.SOCK_STREAM)
+    sock.setblocking(False)
+    return {}, sock
+
+
 def op_udp_socket(ctx, args):
     _args(args, ('family',), ('port', 'broadcast', 'pktinfo', 'reuseaddr'))
     family = _family(args['family'])
@@ -333,6 +342,7 @@ def op_resolve(ctx, args):
 OPS = {
     'hello': op_hello,
     'connect_tcp': op_connect_tcp,
+    'tcp_socket': op_tcp_socket,
     'udp_socket': op_udp_socket,
     'listen_tcp': op_listen_tcp,
     'raw_icmp': op_raw_icmp,

@@ -138,6 +138,20 @@ _tenant_paths = [re.compile(p) for p in (
     r'^/noderange/[^/]+/attributes(/.*)?$',
     r'^/users(/.*)?$',
     r'^/usergroups(/.*)?$',
+    # Hardware management through the tenant's network (plugins in
+    # core.TENANT_PLUGINS; others are refused per node). Nothing that
+    # transfers files or uses the service's own certificate authority.
+    r'^/(nodes|noderange)/[^/]+/power/state$',
+    r'^/(nodes|noderange)/[^/]+/boot/nextdevice$',
+    r'^/(nodes|noderange)/[^/]+/identify$',
+    r'^/(nodes|noderange)/[^/]+/health/hardware$',
+    r'^/(nodes|noderange)/[^/]+/sensors(/.*)?$',
+    r'^/(nodes|noderange)/[^/]+/inventory/hardware/all(/.*)?$',
+    r'^/(nodes|noderange)/[^/]+/inventory/firmware/all(/.*)?$',
+    r'^/(nodes|noderange)/[^/]+/events/hardware/log$',
+    r'^/(nodes|noderange)/[^/]+/configuration/management_controller/'
+    r'(users|net_interfaces|reset|hostname|identifier|domain_name|location|'
+    r'ntp|extended|alerts)(/.*)?$',
 )]
 
 

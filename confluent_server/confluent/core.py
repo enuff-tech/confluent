@@ -56,6 +56,7 @@ except ImportError:
     pass
 import confluent.tasks as tasks
 import confluent.tenancy as tenancy
+import confluent.tenantnet as tenantnet
 import confluent.util as util
 import inspect
 import msgpack
@@ -922,6 +923,27 @@ class BadPlugin(object):
             self.node, self.plugin + ' is not a supported plugin')
 
 
+# Plugins that act on a tenant's hardware through the tenant's own network.
+# Others would act from the host's network and are refused for tenants.
+TENANT_PLUGINS = frozenset(['ipmi', 'redfish', 'null'])
+# Fixed handlers a tenant may reach (configuration only).
+TENANT_HANDLERS = frozenset(['attributes'])
+
+
+class TenantUnsupportedPlugin(object):
+    def __init__(self, node, plugin):
+        self.node = node
+        self.plugin = plugin
+
+    def error(self, *args, **kwargs):
+        yield msg.ConfluentNodeError(
+            self.node, '{0} is not yet available within a tenant'.format(self.plugin))
+
+
+def _tenant_refuses(configmanager, plugpath):
+    return configmanager.tenant is not None and plugpath not in TENANT_PLUGINS
+
+
 class BadCollective(object):
     def __init__(self, node):
         self.node = node
@@ -963,6 +985,8 @@ async def handle_dispatch(connection, cert, dispatch, peername):
     keepalive = tasks.spawn_task(_keepalivefn(connection, xmitlock))
     dispatch = msgpack.unpackb(dispatch[2:], raw=False)
     configmanager = cfm.ConfigManager(dispatch['tenant'])
+    # Work forwarded by another collective member is work for its tenant.
+    tenantnet.enter(dispatch['tenant'])
     nodes = dispatch['nodes']
     inputdata = dispatch['inputdata']
     operation = dispatch['operation']
@@ -991,7 +1015,10 @@ async def handle_dispatch(connection, cert, dispatch, peername):
             if attrname in nodeattr[node]:
                 plugpath = nodeattr[node][attrname]['value']
             if not plugpath and 'default' in plugroute:
-                plugpath = plugroute['default'] 
+                plugpath = plugroute['default']
+        if plugpath and _tenant_refuses(configmanager, plugpath):
+            nodesbyhandler[TenantUnsupportedPlugin(node, plugpath).error] = [node]
+            continue
         if plugpath:
             try:
                 hfunc = getattr(pluginmap[plugpath], operation)
@@ -1136,6 +1163,8 @@ async def handle_node_request(configmanager, inputdata, operation,
     _plugin = None
 
     if 'handler' in plugroute:  # fixed handler definition, easy enough
+        if configmanager.tenant is not None and plugroute['handler'] not in TENANT_HANDLERS:
+            raise exc.ForbiddenRequest('Not yet available within a tenant')
         if isinstance(plugroute['handler'], str):
             hfunc = getattr(pluginmap[plugroute['handler']], operation)
             _plugin = pluginmap[plugroute['handler']]
@@ -1166,6 +1195,9 @@ async def handle_node_request(configmanager, inputdata, operation,
                     plugpath = nodeattr[node][attrname]['value']
                 if not plugpath and 'default' in plugroute:
                     plugpath = plugroute['default']
+            if plugpath and _tenant_refuses(configmanager, plugpath):
+                nodesbyhandler[TenantUnsupportedPlugin(node, plugpath).error] = [node]
+                continue
             if plugpath in dispatch_plugins:
                 cfm.check_quorum()
                 if pathcomponents == ['console', 'ikvm']:

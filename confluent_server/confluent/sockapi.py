@@ -47,7 +47,7 @@ import confluent.core as pluginapi
 import confluent.shellserver as shellserver
 import confluent.collective.manager as collective
 import confluent.tasks as tasks
-import confluent.tenantguard as tenantguard
+import confluent.tenantnet as tenantnet
 import confluent.util as util
 
 tracelog = None
@@ -153,7 +153,7 @@ async def sessionhdl(connection, authname, skipauth=False, cert=None):
         await send_data(connection, {'authpassed': 1})
         if cfm is not None:
             # This connection works for one tenant, held to its network.
-            tenantguard.enter(cfm.tenant)
+            tenantnet.enter(cfm.tenant)
         request = await tlvdata.recv(connection)
         if request and isinstance(request, dict) and 'collective' in request:
             if skipauth:

@@ -73,6 +73,9 @@ def _reset_module_state():
     configmanager._tenantkeys.clear()
     configmanager._leaderlock = None  # asyncio locks belong to one event loop
     configmanager._oldcfgstore = None
+    # get_myname() reads, and if missing writes, /etc/confluent/cfg/myname
+    # regardless of the configuration directory: give it a name instead.
+    configmanager.mycachedname[:] = ['testhost', float('inf')]
     configmanager.statelessmode = False
     auth._passcache.clear()
     auth._passchecking.clear()
@@ -113,6 +116,42 @@ class ConfluentConfig(object):
         self.cfgdir = os.path.join(self.root, name, 'cfg')
         self.start()
         return previous
+
+
+def _reset_aiohmi_state():
+    """aiohmi keeps its IPMI sockets, sessions and socket watcher at module
+    level, bound to the event loop that first used them. A service has one
+    loop; every test has its own, so start each test afresh."""
+    import aiohmi.ipmi.private.session as ipmisession
+    if ipmisession._wakeup is not None:
+        for end in ipmisession._wakeup:
+            end.close()
+    ipmisession._wakeup = None
+    ipmisession.iothread = None
+    ipmisession.iothreadready = False
+    ipmisession.KEEPALIVE_SESSIONS = None
+    ipmisession.sockwatching = True
+    ipmisession.myself = None
+    ipmisession.ipv6support = None
+    ipmisession.selectdeadline = 0
+    del ipmisession.iothreadwaiters[:]
+    del ipmisession.iosockets[:]
+    ipmisession.ioqueue.clear()
+    ipmisession.sessionqueue.clear()
+    session = ipmisession.Session
+    for name in ('bmc_handlers', 'waiting_sessions', 'initting_sessions',
+                 'keepalive_sessions', 'peeraddr_to_nodes', 'socketpool',
+                 'socketnet'):
+        getattr(session, name).clear()
+    del session.iterwaiters[:]
+    session.socketchecking = None
+
+
+@pytest.fixture(autouse=True)
+def aiohmi_state():
+    _reset_aiohmi_state()
+    yield
+    _reset_aiohmi_state()
 
 
 @pytest.fixture

@@ -31,6 +31,7 @@ registered for that tenant (inode of /run/netns/cf-<id>).
 import array
 import asyncio
 import collections
+import ipaddress
 import json
 import os
 import pwd
@@ -38,6 +39,9 @@ import socket
 import struct
 import threading
 import weakref
+
+import aiohmi.util.netcontext as netcontext
+import aiohttp.abc
 
 import confluent.config.configmanager as configmanager
 import confluent.tenantguard as tenantguard
@@ -83,6 +87,7 @@ class BrokerError(TenantNetworkError):
 _EXPECTED = {
     # op -> (domain or None for the requested family, type, protocol)
     'connect_tcp': (None, socket.SOCK_STREAM, socket.IPPROTO_TCP),
+    'tcp_socket': (None, socket.SOCK_STREAM, socket.IPPROTO_TCP),
     'listen_tcp': (None, socket.SOCK_STREAM, socket.IPPROTO_TCP),
     'udp_socket': (None, socket.SOCK_DGRAM, socket.IPPROTO_UDP),
     'raw_icmp': (None, socket.SOCK_RAW, None),
@@ -286,6 +291,11 @@ class TenantNetwork(object):
     def resolve(self, name, family='inet'):
         return self.broker.call('resolve', {'name': name, 'family': family})[0]['addresses']
 
+    def tcp_socket(self, family='inet'):
+        """An unconnected TCP socket of the tenant's network: connecting it
+        routes within the tenant's namespace."""
+        return self.broker.call('tcp_socket', {'family': family}, True)[1]
+
     async def _offload(self, fn, *args):
         return await asyncio.get_running_loop().run_in_executor(None, fn, *args)
 
@@ -297,6 +307,100 @@ class TenantNetwork(object):
 
     async def alist_interfaces(self):
         return await self._offload(self.list_interfaces)
+
+
+_FAMILY_NAMES = {socket.AF_INET: 'inet', socket.AF_INET6: 'inet6'}
+
+
+def _family_name(family):
+    if family in _FAMILY_NAMES:
+        return _FAMILY_NAMES[family]
+    if family in ('inet', 'inet6'):
+        return family
+    raise TenantNetworkError('unsupported address family {0!r}'.format(family))
+
+
+def _literal_family(host):
+    try:
+        addr = ipaddress.ip_address(host.split('%', 1)[0])
+    except ValueError:
+        return None
+    return socket.AF_INET if addr.version == 4 else socket.AF_INET6
+
+
+class TenantNetworkRef(object):
+    """A tenant's network for aiohmi (see aiohmi.util.netcontext).
+
+    The broker is only reached when something actually needs the network,
+    so configuration-only work never depends on it.
+    """
+
+    def __init__(self, tenantid):
+        self.key = ('tenant', tenantid)
+        self.tenant = tenantid
+
+    def _net(self):
+        return network_for(self.tenant)
+
+    def udp_socket(self, family):
+        return self._net().udp_socket(family=_family_name(family))
+
+    def socket_factory(self, addrinfo):
+        return self._net().tcp_socket(family=_family_name(addrinfo[0]))
+
+    async def getaddrinfo(self, host, port):
+        family = _literal_family(host)
+        if family is not None:
+            if family == socket.AF_INET6:
+                return [(family, (host, port, 0, 0))]
+            return [(family, (host, port))]
+        net = self._net()
+        found = []
+        for family in (socket.AF_INET, socket.AF_INET6):
+            try:
+                addresses = await net.aresolve(host, _family_name(family))
+            except BrokerError:
+                continue
+            for addr in addresses:
+                found.append((family, (addr, port) if family == socket.AF_INET
+                              else (addr, port, 0, 0)))
+        if not found:
+            raise socket.gaierror(socket.EAI_NONAME, 'cannot resolve ' + host)
+        return found
+
+    def resolver(self):
+        return TenantResolver(self)
+
+
+class TenantResolver(aiohttp.abc.AbstractResolver):
+    """aiohttp name resolution within a tenant's network."""
+
+    def __init__(self, ref):
+        self.ref = ref
+
+    async def resolve(self, host, port=0, family=socket.AF_INET):
+        results = []
+        for found, sockaddr in await self.ref.getaddrinfo(host, port):
+            if family not in (socket.AF_UNSPEC, found):
+                continue
+            results.append({'hostname': host, 'host': sockaddr[0], 'port': port,
+                            'family': found, 'proto': 0,
+                            'flags': socket.AI_NUMERICHOST})
+        if not results:
+            raise OSError('cannot resolve ' + host)
+        return results
+
+    async def close(self):
+        pass
+
+
+def enter(tenantid):
+    """Make the rest of the current task (and the tasks it starts) work for
+    a tenant: held to its network by tenantguard, and reaching hardware
+    through its broker (aiohmi). None is the default tenant."""
+    tenantguard.enter(tenantid)
+    netcontext.current_network.set(
+        None if tenantid is None else TenantNetworkRef(tenantid))
 
 
 _networks = {}
