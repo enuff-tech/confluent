@@ -161,5 +161,8 @@ jobs:
       - name: Run network namespace tests as root
         # These build real namespaces and veth pairs, so they need root.
         # The unprivileged run above reports them as skipped.
+        # If a test stalls, every thread's stack is printed (and again each
+        # interval), and the step ends well before the job would.
         working-directory: confluent_server
-        run: sudo "$(command -v python)" -m pytest -m netns -p no:cacheprovider
+        timeout-minutes: 12
+        run: sudo "$(command -v python)" -m pytest -m netns -p no:cacheprovider -v -o faulthandler_timeout=240
