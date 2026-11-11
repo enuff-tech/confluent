@@ -1143,7 +1143,7 @@ def _generate_new_id():
     # /etc/passwd.  Leave an equivalent amount of space near the end disused,
     # just in case
     uid = str(confluent.util.securerandomnumber(65537, 4294901759))
-    if 'idmap' not in _cfgstore['main']:
+    if 'idmap' not in _cfgstore.get('main', {}):
         return uid
     while uid in _cfgstore['main']['idmap']:
         uid = str(confluent.util.securerandomnumber(65537, 4294901759))
@@ -1439,7 +1439,12 @@ class ConfigManager(object):
                 raise ValueError("Tenant {0} does not exist".format(tenant))
             self.tenant = tenant
             if 'nodegroups' not in self._cfgstore:
-                self._cfgstore['nodegroups'] = {'everything': {}}
+                self._cfgstore['nodegroups'] = {'everything': {'nodes': set()}}
+                _mark_dirtykey('nodegroups', 'everything', self.tenant)
+            elif 'nodes' not in self._cfgstore['nodegroups'].setdefault('everything', {}):
+                # Tenant stores created before 'everything' carried a node
+                # set; without one, adding any node raises KeyError.
+                self._cfgstore['nodegroups']['everything']['nodes'] = set()
                 _mark_dirtykey('nodegroups', 'everything', self.tenant)
             if 'nodes' not in self._cfgstore:
                 self._cfgstore['nodes'] = {}
@@ -1833,12 +1838,13 @@ class ConfigManager(object):
 
     def _true_create_user(self, name, role="Administrator", uid=None,
                           displayname=None, attributemap=None):
-        if 'idmap' not in _cfgstore['main']:
-            _cfgstore['main']['idmap'] = {}
+        # The id map is service-wide and lives in the main store, which may
+        # not have been opened yet when the first request is for a tenant.
+        idmap = _cfgstore.setdefault('main', {}).setdefault('idmap', {})
         if uid is None:
             uid = _generate_new_id()
         else:
-            if uid in _cfgstore['main']['idmap']:
+            if uid in idmap:
                 raise Exception("Duplicate id requested")
         if 'users' not in self._cfgstore:
             self._cfgstore['users'] = {}
@@ -1858,7 +1864,7 @@ class ConfigManager(object):
         self._cfgstore['users'][name] = {'id': uid, 'role': role}
         if displayname is not None:
             self._cfgstore['users'][name]['displayname'] = displayname
-        _cfgstore['main']['idmap'][uid] = {
+        idmap[uid] = {
             'tenant': self.tenant,
             'username': name,
             'role': role,
@@ -2905,14 +2911,24 @@ class ConfigManager(object):
         _load_dict_from_dbm(['globals'], os.path.join(rootpath, "globals"))
         for confarea in _config_areas:
             _load_dict_from_dbm(['main', confarea], os.path.join(rootpath, confarea))
+        # The service-wide user id map is written alongside the main store;
+        # without it, new user ids are not checked against existing ones.
+        _load_dict_from_dbm(['main', 'idmap'], os.path.join(rootpath, 'idmap'))
+        # Tenant stores are written by _sync_to_file to tenants/<tenant>/ and
+        # live in memory under _cfgstore['tenant'][<tenant>].
+        tenantroot = os.path.join(rootpath, 'tenants')
         try:
-            for tenant in os.listdir(os.path.join(rootpath, 'tenants')):
-                for confarea in _config_areas:
-                    _load_dict_from_dbm(
-                        ['main', tenant, confarea],
-                        os.path.join(rootpath, tenant, confarea))
+            tenants = os.listdir(tenantroot)
         except OSError:
-            pass
+            tenants = []
+        for tenant in tenants:
+            tenantpath = os.path.join(tenantroot, tenant)
+            if not os.path.isdir(tenantpath):
+                continue
+            _cfgstore.setdefault('tenant', {}).setdefault(tenant, {})
+            for confarea in _config_areas:
+                _load_dict_from_dbm(['tenant', tenant, confarea],
+                                    os.path.join(tenantpath, confarea))
 
     @classmethod
     def wait_for_sync(cls, fullsync=False):

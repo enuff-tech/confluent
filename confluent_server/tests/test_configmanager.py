@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import pytest
+import os
 
 import confluent.config.configmanager as configmanager
 
@@ -83,11 +83,9 @@ async def test_tenant_users_are_separate_in_memory(confluent_config):
     assert main.get_user('bob') is None
 
 
-@pytest.mark.xfail(strict=True, raises=KeyError, reason=(
-    "a new tenant's 'everything' group is created without a 'nodes' set "
-    '(ConfigManager.__init__), so adding a node to a tenant raises KeyError; '
-    'to be fixed by the tenant storage change'))
 async def test_tenant_nodes_are_separate_in_memory(confluent_config):
+    # Regression: a new tenant's 'everything' group had no 'nodes' set, so
+    # adding any node to a tenant raised KeyError.
     main = confluent_config.manager()
     await _make_cluster(main)
     tenant = confluent_config.manager('acme', create_tenant=True)
@@ -95,22 +93,117 @@ async def test_tenant_nodes_are_separate_in_memory(confluent_config):
 
     assert configmanager.is_tenant('acme')
     assert sorted(tenant.list_nodes()) == ['n1']
+    assert tenant.get_nodegroup_attributes('everything')['nodes'] == set(['n1'])
     assert _value(tenant, 'n1', 'net.ipv4_address') == '10.0.0.10'
     assert _value(main, 'n1', 'net.ipv4_address') is None
+    assert 'n1' in main.list_nodes()  # main's own n1 from _make_cluster is untouched
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    'tenant stores are written to <cfgdir>/tenants/<tenant>/ but read back from '
-    '<cfgdir>/<tenant>/ into the wrong key (ConfigManager._read_from_path), so '
-    'they are lost on restart; to be fixed by the tenant storage change'))
 async def test_tenant_store_survives_restart(confluent_config):
+    # Regression: tenant stores were written to <cfgdir>/tenants/<tenant>/ but
+    # read back from <cfgdir>/<tenant>/ into the wrong key, so a restart lost
+    # every tenant.
     tenant = confluent_config.manager('acme', create_tenant=True)
-    await tenant.create_user('bob')
+    await tenant.create_user('bob', role='Operator')
+    await tenant.add_group_attributes({'compute': {'console.method': 'ipmi'}})
+    await tenant.set_node_attributes({'c1': {'groups': ['compute'],
+                                             'net.ipv4_address': '10.241.34.2'}},
+                                     autocreate=True)
 
     confluent_config.restart()
 
     assert configmanager.is_tenant('acme')
+    tenant = confluent_config.manager('acme')
+    assert tenant.get_user('bob')['role'] == 'Operator'
+    assert sorted(tenant.list_nodes()) == ['c1']
+    assert _value(tenant, 'c1', 'net.ipv4_address') == '10.241.34.2'
+    assert _value(tenant, 'c1', 'console.method') == 'ipmi'
+    assert tenant.get_nodegroup_attributes('everything')['nodes'] == set(['c1'])
+    assert list(confluent_config.manager().list_nodes()) == []
+
+
+async def test_tenant_user_can_be_created_first_after_restart(confluent_config):
+    # Regression: creating a tenant user before anything had opened the
+    # main store raised KeyError: 'main'.
+    confluent_config.manager('acme', create_tenant=True)
+    confluent_config.restart()
+    await confluent_config.manager('acme').create_user('bob')
     assert confluent_config.manager('acme').get_user('bob') is not None
+
+
+async def test_user_id_map_survives_restart(confluent_config):
+    # Regression: the id map was written to <cfgdir>/idmap but never loaded,
+    # so after a restart new ids were not checked against existing users.
+    main = confluent_config.manager()
+    await main.create_user('alice')
+    await confluent_config.manager('acme', create_tenant=True).create_user('bob')
+    ids = {'alice': main.get_user('alice')['id'],
+           'bob': confluent_config.manager('acme').get_user('bob')['id']}
+
+    confluent_config.restart()
+
+    idmap = configmanager._cfgstore['main']['idmap']
+    assert idmap[ids['alice']] == {'tenant': None, 'username': 'alice', 'role': 'Administrator'}
+    assert idmap[ids['bob']] == {'tenant': 'acme', 'username': 'bob', 'role': 'Administrator'}
+
+
+async def test_empty_tenant_survives_restart(confluent_config):
+    confluent_config.manager('acme', create_tenant=True)
+    confluent_config.restart()
+    assert configmanager.is_tenant('acme')
+    assert list(confluent_config.manager('acme').list_nodes()) == []
+
+
+async def test_tenants_with_identical_nodes_stay_separate_across_restart(confluent_config):
+    for name, serial in (('acme', 'SN-A'), ('globex', 'SN-B')):
+        tenant = confluent_config.manager(name, create_tenant=True)
+        await tenant.set_node_attributes(
+            {'c1': {'net.ipv4_address': '10.241.34.2', 'id.serial': serial}},
+            autocreate=True)
+
+    confluent_config.restart()
+
+    for name, serial in (('acme', 'SN-A'), ('globex', 'SN-B')):
+        tenant = confluent_config.manager(name)
+        assert sorted(tenant.list_nodes()) == ['c1']
+        assert _value(tenant, 'c1', 'net.ipv4_address') == '10.241.34.2'
+        assert _value(tenant, 'c1', 'id.serial') == serial
+
+
+async def test_tenant_deleted_node_stays_deleted_after_restart(confluent_config):
+    tenant = confluent_config.manager('acme', create_tenant=True)
+    await tenant.set_node_attributes({'c1': {}, 'c2': {}}, autocreate=True)
+    await tenant.del_nodes(['c2'])
+
+    confluent_config.restart()
+
+    assert sorted(confluent_config.manager('acme').list_nodes()) == ['c1']
+
+
+async def test_tenant_store_from_older_release_is_repaired(confluent_config):
+    # Stores written before the fix have an 'everything' group without a
+    # node set; opening the tenant must repair it rather than fail later.
+    configmanager._cfgstore.setdefault('tenant', {})['legacy'] = {
+        'nodegroups': {'everything': {}}, 'nodes': {}}
+    tenant = confluent_config.manager('legacy')
+    await tenant.set_node_attributes({'c1': {}}, autocreate=True)
+    assert tenant.get_nodegroup_attributes('everything')['nodes'] == set(['c1'])
+
+    confluent_config.restart()
+
+    assert sorted(confluent_config.manager('legacy').list_nodes()) == ['c1']
+
+
+async def test_stray_file_in_tenants_directory_is_ignored(confluent_config):
+    confluent_config.manager('acme', create_tenant=True)
+    confluent_config.flush()
+    with open(os.path.join(confluent_config.cfgdir, 'tenants', 'README'), 'w') as f:
+        f.write('not a tenant')
+
+    confluent_config.restart()
+
+    assert configmanager.is_tenant('acme')
+    assert not configmanager.is_tenant('README')
 
 
 async def test_restart_does_not_touch_other_directories(confluent_config, tmp_path):
