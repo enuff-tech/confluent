@@ -538,6 +538,7 @@ async def wsock_handler(req):
         return
     httpsessions[sessid]['inflight'].add(rsp)
     name = httpsessions[sessid]['name']
+    sesskey = httpsessions[sessid].get('apikey')
     authdata = auth.authorize(name, req.rel_url.path, operation='start')
     if not authdata:
         return
@@ -580,6 +581,12 @@ async def wsock_handler(req):
                                 action = msg.get('action', None)
                             targ = msg.get('target', None)
                             if targ:
+                                # A session opened with an API key is held
+                                # to the key for every action it carries.
+                                if sesskey is not None and not (
+                                        apikey.key_is_current(configmanager.ConfigManager(None), sesskey) and
+                                        apikey.request_allowed(sesskey, action, targ)):
+                                    continue
                                 authdata = auth.authorize(name, targ, operation=action)
                                 if not authdata:
                                     continue
