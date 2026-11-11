@@ -32,6 +32,12 @@ Python, and would not see a socket opened by native code inside a library.
 The boundary is the namespace, and that only the tenant's broker can make
 sockets in it.
 
+Platform administrators also hand out the enrollment token with which a
+tenant's first administrator is created: whoever holds that token before
+it is used can become that administrator. The separation holds from the
+moment the customer has enrolled; a token cannot be issued for a tenant
+that has an administrator.
+
 **What it does not protect against.** The host's root user, and anyone who
 can run code as the `confluent` service user, keep full visibility and
 control over all tenants on that host: memory, the configuration store and
@@ -273,11 +279,14 @@ nothing. What only the kernel can provide (Landlock, if it is not among
 the active security modules) is told, with the kernel parameter that
 turns it on, and left to the operator.
 
-To have a tenant's media refused, rather than handled with less, on a
-host without Landlock:
+The limits alone do not keep such a worker from what the service can
+read, which is every tenant's data. A tenant's media is therefore refused
+on a host that provides neither the namespaces nor Landlock. This can be
+made stricter or, by an operator who accepts what it means, lifted:
 
     [tenants]
-    media_sandbox = required
+    media_sandbox = required   # only where Landlock applies
+    media_sandbox = none       # also with the resource limits alone
 
 Ready-made profile
 archives are not imported within a tenant, and rebasing only copies from

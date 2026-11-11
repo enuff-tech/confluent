@@ -691,6 +691,11 @@ def _validate_tenant_name(name):
         raise exc.InvalidArgumentException(
             'Tenant names must be 1-63 characters of lowercase letters, '
             'digits and hyphens, starting with a letter or digit')
+    if valid_tenant_id(name):
+        # (a tenant is found by id before by name: such a name could be
+        # taken for another tenant)
+        raise exc.InvalidArgumentException(
+            'A tenant name must not have the form of a tenant id')
     return name
 
 
@@ -1167,6 +1172,8 @@ async def migrate_tenancy():
     for key in unregistered:
         store = _cfgstore['tenant'][key]
         name = key.lower() if _tenant_name_re.match(key.lower()) else None
+        if name is not None and valid_tenant_id(name):
+            name = None
         if name is None or find_tenant(name):
             name = 'tenant-' + hexlify(os.urandom(3)).decode('ascii')
         tenantid = key if valid_tenant_id(key) else _new_tenant_id()

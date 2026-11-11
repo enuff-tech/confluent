@@ -1501,11 +1501,13 @@ class MediaImporter(object):
         else:
             medfile = open(media, 'rb')
         self.limited = cfm is not None and cfm.tenant is not None
-        if self.limited and sandbox.required() and 'landlock' in sandbox.missing():
-            # ([tenants] media_sandbox = required)
+        refused = sandbox.refusal() if self.limited else None
+        if refused:
+            # A worker limited in resources only could read everything the
+            # service can: a tenant's media is not handed to one (unless
+            # the operator says so, see sandbox.policy).
             raise exc.NotImplementedException(
-                'Media of tenants is not imported on this server: it cannot confine '
-                'the programs that read it (see confluent_selfcheck)')
+                'Media of tenants is not imported: {0} (see confluent_selfcheck)'.format(refused))
         try:
             if self.limited:
                 # a tenant's media: read by a worker, its names checked

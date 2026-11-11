@@ -473,3 +473,75 @@ async def test_collective_join_receives_tenancy_settings(mt):
     assert configmanager.multitenancy_enabled()
     assert configmanager.get_global('tenancy.schema') == configmanager.TENANCY_SCHEMA
     assert _ok(auth.authorize('acme/admin', '/nodes/', operation='retrieve'))
+
+
+# ------------------------------------------- after review: lock, names, roles
+
+async def _tenant_api(tid, path, operation='retrieve', inputdata=None):
+    import asyncio
+    import confluent.tenantnet as tenantnet
+    tenantnet.enter(tid)
+    try:
+        result = core.handle_path(path, operation, configmanager.ConfigManager(tid), inputdata)
+        if asyncio.iscoroutine(result):
+            result = await result
+        if hasattr(result, '__aiter__'):
+            result = [r async for r in result]
+        return list(result)
+    finally:
+        tenantnet.enter(None)
+
+
+async def test_tenants_reach_the_deployment_lock_of_their_nodes(mt):
+    for path in ('/nodes/n1/deployment/lock', '/noderange/n1/deployment/lock',
+                 '/noderange/n[1-4]/deployment/lock', '/nodes/n1/deployment/lock.json'):
+        assert auth._tenant_path_allowed(path), path
+    # (what else is under deployment acts from the service's side: not yet)
+    for path in ('/nodes/n1/deployment/ident_image', '/nodes/n1/deployment/remote_config/run',
+                 '/nodes/n1/deployment/lock/x', '/nodes/n1/deployment', '/nodes/n1/deployment/'):
+        assert not auth._tenant_path_allowed(path), path
+    if not core.pluginmap:
+        core.load_plugins()
+    acme = await _tenant('acme')
+    globex = await _tenant('globex')
+    for tid in (acme, globex):
+        await configmanager.ConfigManager(tid).add_node_attributes({'n1': {}})
+    shown = await _tenant_api(acme, '/nodes/n1/deployment/lock')
+    assert shown, 'the lock of a node is told'
+    await _tenant_api(acme, '/nodes/n1/deployment/lock', 'update', {'lock': 'locked'})
+    locked = {tid: configmanager.ConfigManager(tid).get_node_attributes(
+        'n1', 'deployment.lock')['n1'].get('deployment.lock', {}).get('value')
+        for tid in (acme, globex)}
+    assert locked[acme] == 'locked'
+    assert locked[globex] != 'locked'  # the node of the same name elsewhere
+
+
+async def test_a_tenant_name_is_never_the_form_of_an_id(mt):
+    acme = await _tenant('acme')
+    assert configmanager.valid_tenant_id(acme)
+    # a name that is another tenant's id would be taken for that tenant
+    for name in (acme, 't0123456789ab', 't' + 'f' * 12):
+        with pytest.raises(exc.InvalidArgumentException, match='form of a tenant id'):
+            await _api('/tenants/', 'create', {'name': name})
+    assert configmanager.find_tenant(acme) is None
+    # names that merely resemble one are names
+    for name in ('t0123456789abc', 't0123456789a', 'x0123456789ab', 't0123456789ag'):
+        created = (await _api('/tenants/', 'create', {'name': name}))[0]
+        assert created['name'] == name and created['id'] != name
+        assert auth._resolve_tenant(name) == created['id']
+    assert auth._resolve_tenant(acme) == acme and auth._resolve_tenant('acme') == acme
+
+
+async def test_a_user_without_a_role_counts_as_the_administrator_it_is(mt):
+    # authorization takes a missing role for Administrator: so does the
+    # rule that no enrollment token is issued once a tenant has one
+    acme = await _tenant('acme', admin=None)
+    assert not tenancy._has_administrator(acme)
+    cfm = configmanager.ConfigManager(acme)
+    await cfm.create_user('legacy', role='Monitor')
+    assert not tenancy._has_administrator(acme)
+    del cfm._cfgstore['users']['legacy']['role']
+    assert 'role' not in cfm.get_user('legacy')
+    assert tenancy._has_administrator(acme)
+    with pytest.raises(exc.InvalidArgumentException, match='already has an administrator'):
+        await tenancy.issue_enrollment(acme)
