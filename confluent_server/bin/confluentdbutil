@@ -34,7 +34,10 @@ import confluent.noderange as noderange
 argparser = optparse.OptionParser(
     usage="Usage: %prog [options] [dump|restore|merge] [path]\n"
           "       %prog [-u] [-v] showattrib <noderange> <attribute>...\n"
-          "       %prog [-d directory] migrate-tenancy")
+          "       %prog [-d directory] migrate-tenancy\n"
+          "       %prog [-p password|-i] [-r] export-tenant <tenant|default> <path>\n"
+          "       %prog [-p password|-i] [--no-users] [--keep-apikeys] "
+          "import-tenant <tenant|default> <path>")
 argparser.add_option('-d', '--directory', dest='directory', default=None,
                      help='Directory of binary confluent configuration, defaults to /etc/confluent/cfg')
 argparser.add_option('-p', '--password',
@@ -70,6 +73,12 @@ argparser.add_option('-v', '--value-only', dest='valueonly',
                      action='store_true',
                      help='With showattrib, print only the values '
                           'without node and attribute names')
+argparser.add_option('--no-users', dest='nousers', action='store_true',
+                     help='With import-tenant, do not import the users and '
+                          'user groups of the package')
+argparser.add_option('--keep-apikeys', dest='keepapikeys', action='store_true',
+                     help='With import-tenant, keep the API keys of imported '
+                          'users valid (by default they are not imported)')
 (options, args) = argparser.parse_args()
 
 
@@ -208,8 +217,117 @@ def migrate_tenancy(options):
     sys.exit(0)
 
 
+def _unlock_store(options):
+    cfm.init(cfgdir=options.directory)
+    try:
+        main._initsecurity(conf.get_config())
+        if not cfm._masterkey:
+            cfm.init_masterkey(autogen=False)
+    except Exception:
+        sys.stderr.write("Error unlocking credential store\n")
+        sys.exit(1)
+
+
+def _tenant_config(name):
+    """The configuration named on the command line: a tenant by name or
+    id, or 'default' for the installation's own."""
+    if name == 'default':
+        return cfm.ConfigManager(None)
+    tenantid = name if cfm.valid_tenant_id(name) and cfm.get_tenant(name) else cfm.find_tenant(name)
+    if tenantid is None:
+        sys.stderr.write('No such tenant: {0}\n'.format(name))
+        sys.exit(1)
+    return cfm.ConfigManager(tenantid)
+
+
+def _package_password(options, confirm):
+    password = options.password
+    if options.interactivepassword:
+        password = getpass.getpass('Enter the passphrase of the package: ')
+        if confirm and password != getpass.getpass('Confirm the passphrase: '):
+            sys.stderr.write('Passphrases do not match\n')
+            sys.exit(1)
+    return password
+
+
+def export_tenant(options, args):
+    """Write one tenant's configuration (or the default one) as a package."""
+    import confluent.tenantexport as tenantexport
+    if len(args) != 3:
+        argparser.print_help()
+        sys.exit(1)
+    password = _package_password(options, True)
+    if not password and not options.redact:
+        sys.stderr.write('Specify a passphrase with -p or -i to protect the '
+                         'secrets of the package, or -r to leave them out\n')
+        sys.exit(1)
+    _unlock_store(options)
+    try:
+        files = tenantexport.build(_tenant_config(args[1]), password,
+                                   redact=bool(options.redact))
+        tenantexport.write(files, args[2])
+    except Exception as e:
+        sys.stderr.write('Export failed: {0}\n'.format(e))
+        sys.exit(1)
+    print('Exported to {0}{1}'.format(args[2], ' (redacted)' if options.redact else ''))
+    sys.exit(0)
+
+
+def import_tenant(options, args):
+    """Import a package into an empty tenant (or an empty installation)."""
+    import confluent.tenantexport as tenantexport
+    if len(args) != 3:
+        argparser.print_help()
+        sys.exit(1)
+    if main.is_running() is not None:
+        print("Confluent is running, must shut down to import into the db")
+        sys.exit(1)
+    password = _package_password(options, False)
+    _unlock_store(options)
+    cfg = _tenant_config(args[1])
+
+    async def run():
+        report = await tenantexport.import_package(
+            cfg, tenantexport.read(args[2]), password,
+            users=not options.nousers, keep_apikeys=bool(options.keepapikeys))
+        cfm.ConfigManager.wait_for_sync(True)
+        return report
+    try:
+        report = asyncio.run(run())
+    except Exception as e:
+        sys.stderr.write('Import failed, nothing was changed: {0}\n'.format(e))
+        sys.exit(1)
+    if report['status'] == 'already imported':
+        print('This package was already imported: nothing to do')
+        sys.exit(0)
+    print('Imported {0} nodes, {1} groups, {2} secrets and {3} users'.format(
+        report['nodes'], report['groups'], report['secrets'], len(report['users'])))
+    if report['users_kept']:
+        print('Users that already existed were kept as they are: ' +
+              ', '.join(sorted(report['users_kept'])))
+    skipped = report['not_imported']
+    if 'users' in skipped:
+        print('Users of the package were not imported: ' + ', '.join(skipped['users']))
+    if 'discovery.subscriptions' in skipped:
+        print('Discovery subscriptions belong to an installation and were not '
+              'imported: ' + ', '.join(skipped['discovery.subscriptions']))
+    if 'netcfg' in skipped:
+        target = os.path.join(args[2], 'netcfg-nmstate.yaml')
+        with open(target, 'w') as out:
+            out.write(tenantexport.nmstate(skipped['netcfg']))
+        print('The network the tenant managed was not applied; it is written, '
+              'for review, as an nmstate document to ' + target)
+    if options.directory is None:
+        _chown_like_etc_confluent()
+    sys.exit(0)
+
+
 if args and args[0] == 'showattrib':
     show_attrib(options, args)
+if args and args[0] == 'export-tenant':
+    export_tenant(options, args)
+if args and args[0] == 'import-tenant':
+    import_tenant(options, args)
 if args == ['migrate-tenancy']:
     migrate_tenancy(options)
 if len(args) != 2 or args[0] not in ('dump', 'restore', 'merge'):
