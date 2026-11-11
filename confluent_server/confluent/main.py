@@ -32,6 +32,8 @@ import atexit
 import confluent.auth as auth
 import confluent.config.conf as conf
 import confluent.config.configmanager as configmanager
+import confluent.tenantguard as tenantguard
+import confluent.tenantnet as tenantnet  # noqa: F401 (closes sockets of disabled tenants)
 import confluent.debugger as debugger
 try:
     import anydbm as dbm
@@ -306,6 +308,8 @@ def run(args):
     asyncio.run(asyncrun(args))
 
 async def asyncrun(args):
+    # Work for a tenant may only use that tenant's network (see tenantguard).
+    tenantguard.install(asyncio.get_running_loop())
     setlimits()
     try:
         configmanager.ConfigManager(None)

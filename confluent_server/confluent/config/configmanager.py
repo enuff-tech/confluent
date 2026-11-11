@@ -830,10 +830,28 @@ def _rpc_set_tenant_state(tenantid, state):
     _true_set_tenant_state(tenantid, state)
 
 
+_tenant_state_watchers = []
+
+
+def watch_tenant_state(callback):
+    """Call callback(tenantid, state) on this member whenever a tenant's
+    state changes; state is 'deleted' when it is removed."""
+    _tenant_state_watchers.append(callback)
+
+
+def _notify_tenant_state(tenantid, state):
+    for callback in list(_tenant_state_watchers):
+        try:
+            callback(tenantid, state)
+        except Exception:
+            logException()
+
+
 def _true_set_tenant_state(tenantid, state):
     _cfgstore['tenant'][tenantid]['meta']['state'] = state
     _mark_dirtykey('meta', 'state', tenantid)
     ConfigManager._bg_sync_to_file()
+    _notify_tenant_state(tenantid, state)
 
 
 # Service-wide tenancy settings: unlike other globals, these must be the
@@ -961,6 +979,7 @@ def _true_delete_tenant(tenantid):
     for watchers in (ConfigManager._attribwatchers, ConfigManager._nodecollwatchers):
         watchers.pop(tenantid, None)
     ConfigManager._bg_sync_to_file()
+    _notify_tenant_state(tenantid, 'deleted')
 
 
 def _remove_tenant_directory(cfgdir, tenantid):
