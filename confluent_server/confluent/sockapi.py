@@ -518,7 +518,7 @@ class SockApi(object):
         global auditlog
         global tracelog
         tracelog = log.Logger('trace')
-        auditlog = log.Logger('audit')
+        auditlog = log.AuditLog()
         self.tlsserver = None
         if self.should_run_remoteapi():
             self.start_remoteapi()

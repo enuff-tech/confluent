@@ -1401,6 +1401,6 @@ class HttpApi(object):
             _cleaner = asyncio.get_running_loop().create_task(
                 _sessioncleaner())
         tracelog = log.Logger('trace')
-        auditlog = log.Logger('audit')
+        auditlog = log.AuditLog()
         self.server = asyncio.get_running_loop().create_task(
             serve(self.bind_host, self.bind_port, self.bind_group, self.bind_perms))

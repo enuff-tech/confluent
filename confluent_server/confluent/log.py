@@ -68,6 +68,7 @@ import confluent.config.configmanager
 import confluent.config.conf as conf
 import confluent.exceptions as exc
 import confluent.tasks as tasks
+import confluent.tenantguard as tenantguard
 import glob
 import json
 import os
@@ -535,6 +536,8 @@ class Logger(object):
             relpath = 'consoles/' + logname
         else:
             relpath = logname
+        if tenant is not None:
+            relpath = 'tenants/{0}/{1}'.format(tenant, relpath)
         if relpath in _loggers:
             return _loggers[relpath]
         else:
@@ -546,14 +549,10 @@ class Logger(object):
             return
         self.initialized = True
         self.buffered = buffered
-        self.filepath = confluent.config.configmanager.get_global("logdirectory")
-        if self.filepath is None:
-            if os.name == 'nt':
-                self.filepath = os.path.join(
-                    os.getenv('SystemDrive'), '\\ProgramData', 'confluent',
-                    'logs')
-            else:
-                self.filepath = "/var/log/confluent"
+        self.tenant = tenant
+        # Each tenant has a log tree of its own (events, audit, consoles):
+        # node and log names repeat between tenants, their logs do not mix.
+        self.filepath = tenant_directory(tenant)
         self.isconsole = console
         if console:
             self.filepath = os.path.join(self.filepath, "consoles")
@@ -792,15 +791,125 @@ class Logger(object):
 
 globaleventlog = None
 tracelog = None
+_tenantlogs = {}
+
+
+def base_directory():
+    """Where the service's logs are kept."""
+    filepath = confluent.config.configmanager.get_global("logdirectory")
+    if filepath is None:
+        if os.name == 'nt':
+            filepath = os.path.join(
+                os.getenv('SystemDrive'), '\\ProgramData', 'confluent',
+                'logs')
+        else:
+            filepath = "/var/log/confluent"
+    return filepath
+
+
+def tenant_directory(tenant):
+    """Where a tenant's logs are kept: <logs>/tenants/<id> (the log
+    directory itself for the default tenant)."""
+    if tenant is None:
+        return base_directory()
+    if not confluent.config.configmanager.valid_tenant_id(tenant):
+        raise ValueError('invalid tenant id')
+    return os.path.join(base_directory(), 'tenants', tenant)
+
+
+def _known_tenant(tenant):
+    if tenant is None:
+        return None
+    cfm = confluent.config.configmanager
+    if not cfm.valid_tenant_id(tenant) or cfm.get_tenant(tenant) is None:
+        return None  # not (or no longer) a tenant: nothing is kept for it
+    return tenant
+
+
+def tenant_logger(name, tenant):
+    """The log called name of a tenant (None: the service's own)."""
+    tenant = _known_tenant(tenant)
+    if tenant is None:
+        return Logger(name)
+    key = (tenant, name)
+    if key not in _tenantlogs:
+        _tenantlogs[key] = Logger(name, tenant=tenant)
+    return _tenantlogs[key]
 
 
 def log(logdata=None, ltype=None, event=0, eventdata=None, flush=False):
+    """Record an event.
+
+    Events of work done for a tenant go to that tenant's event log, all
+    others to the service's: what happens in one tenant (its nodes, its
+    discovery, its deployments) is not written where another tenant's
+    events are.
+    """
+    global globaleventlog
+    tenant = _known_tenant(tenantguard.current_tenant.get())
+    if tenant is not None:
+        eventlog = tenant_logger('events', tenant)
+    else:
+        if globaleventlog is None:
+            globaleventlog = Logger('events')
+        eventlog = globaleventlog
+    eventlog.log(logdata, ltype, event, eventdata)
+    if flush:
+        eventlog.writedata()
+
+
+def service_log(logdata=None, ltype=None, event=0, eventdata=None, flush=False):
+    """Record an event of the service itself, whichever tenant the task
+    works for: for what its operator must see (a tenant whose network is
+    not available, say). It must not carry a tenant's data."""
     global globaleventlog
     if globaleventlog is None:
         globaleventlog = Logger('events')
     globaleventlog.log(logdata, ltype, event, eventdata)
     if flush:
         globaleventlog.writedata()
+
+
+class AuditLog(object):
+    """The audit trail: requests of a tenant's principals are recorded in
+    that tenant's audit log, all others in the service's."""
+
+    def __init__(self):
+        self.servicelog = None
+
+    def log(self, auditmsg, tenant=None):
+        if tenant is None and isinstance(auditmsg, dict):
+            tenant = auditmsg.get('tenant')
+        tenant = _known_tenant(tenant)
+        if tenant is not None:
+            return tenant_logger('audit', tenant).log(auditmsg)
+        if self.servicelog is None:
+            self.servicelog = Logger('audit')
+        return self.servicelog.log(auditmsg)
+
+
+def close_tenant(tenant):
+    """Stop writing a tenant's logs (it is being deleted)."""
+    for key in [key for key in _tenantlogs if key[0] == tenant]:
+        logger = _tenantlogs.pop(key)
+        for pending in (logger.writer, logger.closer):
+            if pending is not None:
+                try:
+                    pending.cancel()
+                except RuntimeError:
+                    pass
+        try:
+            logger.handler.close()
+        except Exception:
+            pass
+
+
+def remove_tenant(tenant):
+    """Delete a tenant's logs, with the tenant (see tenantpaths). The
+    directory is derived from the validated id and removed without
+    following links."""
+    close_tenant(tenant)
+    confluent.config.configmanager._remove_tenant_directory(base_directory(), tenant)
 
 def logtrace():
     global tracelog
