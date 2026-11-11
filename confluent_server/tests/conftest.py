@@ -35,6 +35,11 @@ _REPO = os.path.dirname(_SERVER)
 for _path in (_SERVER, os.path.join(_REPO, 'confluent_client'), _TESTS):
     if _path not in sys.path:
         sys.path.insert(0, _path)
+# Worker processes the server starts (such as the configuration dump worker)
+# need to import the same source tree.
+os.environ['PYTHONPATH'] = os.pathsep.join(
+    [_SERVER, os.path.join(_REPO, 'confluent_client')] +
+    [p for p in os.environ.get('PYTHONPATH', '').split(os.pathsep) if p])
 
 import confluent.auth as auth
 import confluent.config.configmanager as configmanager
@@ -65,6 +70,10 @@ def _reset_module_state():
     configmanager.cfgleader = None
     configmanager.cfgstreams = {}
     configmanager._pendingchangesets.clear()
+    configmanager._tenantkeys.clear()
+    configmanager._leaderlock = None  # asyncio locks belong to one event loop
+    configmanager._oldcfgstore = None
+    configmanager.statelessmode = False
     auth._passcache.clear()
     auth._passchecking.clear()
 
@@ -93,6 +102,17 @@ class ConfluentConfig(object):
         _flush()
         _reset_module_state()
         self.start()
+
+    def switch(self, name):
+        """Write everything out and continue with a different, empty store
+        under the same temporary root, as a second server would see it.
+        Returns the previous store's directory."""
+        _flush()
+        _reset_module_state()
+        previous = self.cfgdir
+        self.cfgdir = os.path.join(self.root, name, 'cfg')
+        self.start()
+        return previous
 
 
 @pytest.fixture
