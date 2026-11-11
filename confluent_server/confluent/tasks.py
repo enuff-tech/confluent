@@ -159,6 +159,38 @@ def spawn_task(coro):
         return asyncio.get_running_loop().create_task(coro)
 
 
+async def _cancel_until_done(pending, attempts, interval):
+    for _ in range(attempts):
+        pending = [task for task in pending if not task.done()]
+        if not pending:
+            return
+        for task in pending:
+            task.cancel()
+        await asyncio.sleep(interval)
+
+
+def cancel_all(pending, attempts=50, interval=0.1):
+    """Cancel tasks, and keep at it until they have ended.
+
+    One cancel() is not always enough: before Python 3.12 a task waiting
+    in asyncio.wait_for misses a cancellation that arrives as the awaited
+    result does, and a task that loops then carries on as if never asked.
+    """
+    pending = [task for task in pending if task is not None and not task.done()]
+    for task in pending:
+        try:
+            task.cancel()
+        except RuntimeError:  # its event loop is gone
+            pass
+    if not pending:
+        return
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:  # no running event loop to follow up in
+        return
+    spawn_task(_cancel_until_done(pending, attempts, interval))
+
+
 def spawn(coro):
     global tasksitter
     if not tasksitter:

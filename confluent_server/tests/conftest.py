@@ -22,8 +22,10 @@ module state before and after each test, so tests never touch a real
 installation and never see each other's data.
 """
 
+import asyncio
 import os
 import sys
+import warnings
 
 import pytest
 
@@ -166,6 +168,38 @@ def aiohmi_state():
     _reset_aiohmi_state()
     yield
     _reset_aiohmi_state()
+
+
+@pytest.fixture(autouse=True)
+async def no_tasks_left_behind():
+    """End every task a test started before its event loop is closed.
+
+    Closing the loop cancels what is left once and waits for it. A task
+    that misses that one cancellation (see confluent.tasks.cancel_all)
+    would stall the run, so they are cancelled here until they are gone,
+    and named if they will not go.
+    """
+    yield
+    disco = sys.modules.get('confluent.discovery.core')
+    if disco is not None:
+        for tenant in list(disco._tenant_listeners):
+            disco.stop_tenant_detection(tenant)
+    services = sys.modules.get('confluent.tenantservices')
+    if services is not None:
+        for tenant in list(services._services):
+            services.stop(tenant)
+    me = asyncio.current_task()
+    pending = []
+    for _ in range(100):
+        pending = [t for t in asyncio.all_tasks() if t is not me and not t.done()]
+        if not pending:
+            break
+        for task in pending:
+            task.cancel()
+        await asyncio.sleep(0.05)
+    if pending:
+        warnings.warn('tasks that ignore cancellation: {0!r}'.format(pending),
+                      stacklevel=2)
 
 
 @pytest.fixture
