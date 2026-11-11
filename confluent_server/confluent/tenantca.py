@@ -134,6 +134,36 @@ def issue_server_certificate(cacert, cakey, names, days=SERVER_DAYS):
                               serialization.NoEncryption()))
 
 
+async def sign_node_certificate(tenant, csrpem, nodename, names, days):
+    """A certificate for one of the tenant's nodes, from its signing
+    request: for nodename and names, signed by the tenant's authority.
+    Returns the certificate (PEM)."""
+    cacert, cakey = await get_ca(tenant)
+    if isinstance(csrpem, str):
+        csrpem = csrpem.encode()
+    request = x509.load_pem_x509_csr(csrpem)
+    if not request.is_signature_valid:
+        raise ValueError('invalid certificate signing request')
+    # the subject and names are the node's as configured, never the ones
+    # the request asks for
+    subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, nodename[:64])])
+    cert = (x509.CertificateBuilder()
+            .subject_name(subject).issuer_name(cacert.subject)
+            .public_key(request.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(_now() - datetime.timedelta(minutes=5))
+            .not_valid_after(_now() + datetime.timedelta(days=days))
+            .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+            .add_extension(x509.SubjectAlternativeName(_alt_names(names)), critical=False)
+            .add_extension(x509.ExtendedKeyUsage(
+                [ExtendedKeyUsageOID.SERVER_AUTH, ExtendedKeyUsageOID.CLIENT_AUTH]),
+                critical=False)
+            .add_extension(x509.AuthorityKeyIdentifier.from_issuer_public_key(
+                cakey.public_key()), critical=False)
+            .sign(cakey, hashes.SHA384()))
+    return cert.public_bytes(serialization.Encoding.PEM)
+
+
 async def server_context(tenant, names):
     """A TLS server context presenting a fresh certificate of the tenant's
     authority for names. The certificate's key exists only in memory (and

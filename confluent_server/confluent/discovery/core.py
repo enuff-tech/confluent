@@ -1992,10 +1992,10 @@ def tenant_detection_status(tenant):
 def _for_tenant(tenant, func):
     """func as a configuration watcher that works for tenant, whichever
     task the change came from."""
-    async def watcher(*args):
+    async def watcher(*args, **kwargs):
         async def run():
             tenantnet.enter(tenant)
-            result = func(*args)
+            result = func(*args, **kwargs)
             if inspect.isawaitable(result):
                 await result
         await tasks.spawn_task(run())
@@ -2046,7 +2046,7 @@ async def _tenant_detection(tenant, state):
         _watch_tenant_attributes(cfg),
         cfg.watch_nodecollection(_for_tenant(tenant, _tenant_nodes_changed)),
     ]
-    for listener in (ssdp.snoop(safe_detected, None, ssdp, None),
+    for listener in (ssdp.snoop(safe_detected, None, ssdp, get_node_by_uuid_or_mac),
                      slp.snoop(safe_detected, slp),
                      pxe.snoop(safe_detected, pxe, get_node_guess_by_uuid)):
         state['tasks'].append(tasks.spawn_task(_tenant_listener(tenant, listener)))

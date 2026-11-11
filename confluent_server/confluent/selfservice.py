@@ -7,6 +7,9 @@ import confluent.noderange as noderange
 import confluent.sshutil as sshutil
 import confluent.util as util
 from confluent import certutil
+import confluent.tenantca as tenantca
+import confluent.tenantnet as tenantnet
+import confluent.tenantpaths as tenantpaths
 import ipaddress
 import confluent.discovery.handlers.xcc as xcc
 import confluent.discovery.handlers.tsm as tsm
@@ -116,12 +119,21 @@ async def get_extra_names(nodename, cfg, myip=None, preferadjacent=False, addloc
             names.update(routedaddrs)
     return names
 
-# What a tenant's nodes may ask for so far. Deployment content, node
-# certificates and remote configuration are not served within tenants yet.
+# What a tenant's nodes may ask for. SSH certificates, remote
+# configuration (ansible, file synchronization) and remote BMC
+# configuration are not available within tenants yet.
 TENANT_PATHS = frozenset([
     '/self/bmcconfig', '/self/myattribs', '/self/netcfg', '/self/nodelist',
-    '/self/updatestatus', '/self/saveapikey',
+    '/self/updatestatus', '/self/saveapikey', '/self/deploycfg',
+    '/self/deploycfg2', '/self/tlscert',
 ])
+TENANT_PREFIXES = ('/self/scriptlist/', '/self/profileprivate/pending/')
+
+
+async def _host_output(*cmd):
+    # Facts about the host (time zone, locale) come from its own tools,
+    # asked outside any tenant: nothing of the request goes into them.
+    return await tenantnet.outside_tenant(util.check_output(*cmd))
 
 
 async def handle_request(req, make_response, mimetype, tenant=None,
@@ -209,7 +221,7 @@ async def handle_request(req, make_response, mimetype, tenant=None,
     if ea.get(nodename, {}).get('deployment.apiarmed', {}).get('value', None) == 'once':
         await cfg.set_node_attributes({nodename: {'deployment.apiarmed': ''}})
     if tenant is not None:
-        if reqpath not in TENANT_PATHS:
+        if reqpath not in TENANT_PATHS and not reqpath.startswith(TENANT_PREFIXES):
             return await make_response(
                 mimetype, 501, 'Not Implemented',
                 body='Not available to the nodes of a tenant')
@@ -314,8 +326,18 @@ async def handle_request(req, make_response, mimetype, tenant=None,
             try:
                 ifidx = int(nicname)
             except ValueError:
-                with open('/sys/class/net/{}/ifindex'.format(nicname), 'r') as nici:
-                    ifidx = int(nici.read())
+                if tenant is not None:
+                    # an interface of the tenant's network, not the host's
+                    ifidx = None
+                    for iface in await tenantnet.current_network().alist_interfaces():
+                        if iface['name'] == nicname:
+                            ifidx = iface['index']
+                    if ifidx is None:
+                        return await make_response(mimetype, 400, 'Bad Request',
+                                                   body='Unknown interface')
+                else:
+                    with open('/sys/class/net/{}/ifindex'.format(nicname), 'r') as nici:
+                        ifidx = int(nici.read())
             ncfg = await netutil.get_nic_config(cfg, nodename, ifidx=ifidx)
         else:
             ncfg = await netutil.get_nic_config(cfg, nodename, serverip=myip, clientip=clientip)
@@ -340,7 +362,7 @@ async def handle_request(req, make_response, mimetype, tenant=None,
         ncfg['profile'] = profile
         protocol = deployinfo.get('deployment.useinsecureprotocols', {}).get(
             'value', 'never')
-        ncfg['confluent_uuid'] = configmanager.get_global('confluent_uuid')
+        ncfg['confluent_uuid'] = cfg.service_uuid()
         ncfg['textconsole'] = bool(deployinfo.get(
                                   'console.method', {}).get('value', None))
         if protocol == 'always':
@@ -386,7 +408,7 @@ async def handle_request(req, make_response, mimetype, tenant=None,
                 pass
             if needlocalectl:
                 try:
-                    langinfo = (await util.check_output('localectl', 'status'))[0].split(b'\n')
+                    langinfo = (await _host_output('localectl', 'status'))[0].split(b'\n')
                 except Exception:
                     langinfo = []
                 for line in langinfo:
@@ -413,7 +435,7 @@ async def handle_request(req, make_response, mimetype, tenant=None,
                             continue
                         keymap = ckeymap
             try:
-                tdcout, tdcerr = await util.check_output('timedatectl')
+                tdcout, tdcerr = await _host_output('timedatectl')
                 tdc = tdcout.split(b'\n')
             except (subprocess.CalledProcessError, FileNotFoundError):
                 tdc = []
@@ -448,6 +470,17 @@ async def handle_request(req, make_response, mimetype, tenant=None,
         csr = reqbody.decode('utf8')
         pals = await get_extra_names(nodename, cfg, myip, addlocalhost=False)
         pals.add(nodename)
+        if tenant is not None:
+            # signed by the tenant's own authority
+            tls_lifetime = cfg.get_node_attributes(nodename, 'pubkeys.tls_lifetime')
+            tls_lifetime = tls_lifetime.get(nodename, {}).get(
+                'pubkeys.tls_lifetime', {}).get('value', None)
+            try:
+                cert = await tenantca.sign_node_certificate(
+                    tenant, csr, nodename, pals, int(tls_lifetime or 47))
+            except ValueError:
+                return await make_response(mimetype, 400, 'Bad Request', body='Bad Request')
+            return await make_response('application/x-pem-file', 200, 'OK', body=cert)
         with tempfile.NamedTemporaryFile() as tmpfile:
             tmpfile.write(csr.encode())
             tmpfile.flush()
@@ -623,7 +656,7 @@ async def handle_request(req, make_response, mimetype, tenant=None,
         scriptcat = reqpath.replace('/self/scriptlist/', '')
         slist, _ = get_scriptlist(
             scriptcat, cfg, nodename,
-            '/var/lib/confluent/public/os/{0}/scripts/{1}')
+            tenantpaths.public_path(tenant, 'os', '{0}', 'scripts', '{1}'))
         if slist:
             mrsp = await make_response('application/yaml', 200, 'OK')
             await mrsp.write(yamldump(util.natural_sort(slist)))
@@ -639,10 +672,17 @@ async def handle_request(req, make_response, mimetype, tenant=None,
             'deployment.pendingprofile', {}).get('value', '')
         if not profile:
             return await make_response(mimetype, 400, 'No pending profile', body='No profile')
-        fname = '/var/lib/confluent/private/os/{}/{}'.format(profile, fname)
+        privbase = os.path.join(tenantpaths.private_root(tenant), 'os', profile, '')
+        fname = privbase + fname
         fullpath = os.path.abspath(fname)
-        if not fullpath.startswith('/var/lib/confluent/private/os/{}/'.format(profile)):
+        if not fullpath.startswith(privbase):
             return await make_response(mimetype, 400, 'Bad Request', body='Bad Request')
+        if tenant is not None:
+            # nor through a link that leaves the tenant's tree
+            fname = tenantpaths.contained_file(tenantpaths.private_root(tenant),
+                                               os.path.relpath(fullpath, tenantpaths.private_root(tenant)))
+            if fname is None:
+                return await make_response(mimetype, 404, 'Not Found', body='Not found')
         try:
             with open(fname, 'rb') as privdata:
                 return await make_response(mimetype, 200, 'OK', body=privdata.read())

@@ -33,6 +33,7 @@ import confluent.log as log
 import confluent.netutil as netutil
 import confluent.util as util
 import confluent.tasks as tasks
+import confluent.tenantpaths as tenantpaths
 import confluent.tenantstate as tenantstate
 import aiohmi.util.netcontext as netcontext
 import ctypes
@@ -61,6 +62,13 @@ ignoredisco = tenantstate.TenantScoped()
 def _tenant_net():
     """The current task's tenant network, None for the host's."""
     return netcontext.current_network.get()
+
+
+def _public(*parts):
+    """A path in the public deployment tree of the current task's tenant
+    (/var/lib/confluent/public/... for the default tenant)."""
+    net = _tenant_net()
+    return tenantpaths.public_path(None if net is None else net.tenant, *parts)
 
 mcastv6addr = 'ff02::1:2'
 
@@ -139,8 +147,8 @@ pxearchs = {
 }
 
 
-shorturls = {}
-urlidbyurl = {}
+shorturls = tenantstate.TenantScoped()
+urlidbyurl = tenantstate.TenantScoped()
 def register_shorturl(url, can302=True, relurl=None, filename=None):
     if url in urlidbyurl:
         return urlidbyurl[url]
@@ -294,15 +302,19 @@ def relay_proxydhcp(sock, pktq):
     pktq.put_nowait((disco, peer, myipn, idx, recv, node, opts, data))
 
 
-async def proxydhcp(handler, nodeguess):
-    net4011 = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    net4011.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    net4011.setsockopt(socket.IPPROTO_IP, IP_PKTINFO, 1)
-    net4011.bind(('', 4011))
+async def proxydhcp(handler, nodeguess, tenant=None):
+    if tenant is not None:
+        # in the tenant's network, on a socket from its broker
+        net4011 = netutil.tenant_udp_socket(socket.AF_INET, 4011, pktinfo=True)
+    else:
+        net4011 = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        net4011.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        net4011.setsockopt(socket.IPPROTO_IP, IP_PKTINFO, 1)
+        net4011.bind(('', 4011))
     cloop = asyncio.get_running_loop()
     pktq = asyncio.Queue()
     cloop.add_reader(net4011, relay_proxydhcp, net4011, pktq)
-    cfg = cfm.ConfigManager(None)
+    cfg = cfm.ConfigManager(tenant)
     while True:
         try:
             disco, client, myipn, idx, recv, node, opts, data = await pktq.get()
@@ -331,6 +343,10 @@ async def proxydhcp(handler, nodeguess):
                 continue
             if disco['arch'] == 'uefi-httpboot':
                 # HTTP boot is offered by the DHCP path, not proxyDHCP
+                continue
+            if tenant is not None and opts.get(77, None) != b'iPXE':
+                # the other boot files are fetched by TFTP, which is not
+                # served in tenant networks
                 continue
             insecuremode = cfd.get(node, {}).get('deployment.useinsecureprotocols',
                 {}).get('value', 'never')
@@ -363,7 +379,7 @@ async def proxydhcp(handler, nodeguess):
                     log.log({'info': 'No pending profile for {0}, skipping proxyDHCP reply'.format(node)})
                     continue
                 myip = socket.inet_ntoa(myipn)
-                if disco['arch'] == 'bios-x86' or not os.path.exists('/var/lib/confluent/public/os/{0}/boot.ipxe.shim'.format(profile)):
+                if disco['arch'] == 'bios-x86' or not os.path.exists(_public('os', profile, 'boot.ipxe.shim')):
                     bootfile = 'http://{0}/confluent-public/os/{1}/boot.ipxe'.format(myip, profile).encode('utf8')
                 else:
                     bootfile = 'http://{0}/confluent-public/os/{1}/boot.ipxe.shim'.format(myip, profile).encode('utf8')
@@ -437,7 +453,8 @@ async def _tenant_snoop(handler, nodeguess, tenant):
     The tenant's DHCP and DHCPv6 traffic is detected and, as configured on
     its nodes (net.ipv4_method, net.lease_time), answered with their
     static addresses; nodes set to dhcp are left to the tenant's own DHCP
-    service. Network boot (proxyDHCP, boot files) is not offered yet.
+    service. Nodes with a pending deployment are offered UEFI HTTP boot or
+    iPXE from the tenant's own content; boot files that need TFTP are not.
     """
     global tracelog
     tracelog = log.Logger('trace')
@@ -466,6 +483,8 @@ async def _tenant_snoop(handler, nodeguess, tenant):
     cloop = asyncio.get_running_loop()
     cloop.add_reader(net4, new_dhcp_packet, handler, nodeguess, cfg, net4)
     cloop.add_reader(net6, new_dhcp6_packet, handler, net6, cfg, nodeguess)
+    # and proxyDHCP, for as long as this listener runs
+    await proxydhcp(handler, nodeguess, tenant)
 
 
 async def snoop(handler, protocol=None, nodeguess=None):
@@ -689,8 +708,6 @@ async def check_reply(node, info, packet, sock, cfg, reqview, addr, requestor):
         return await reply_dhcp4(node, info, packet, cfg, reqview, httpboot, cfd, profile, sock, requestor, niccfg=niccfg)
 
 async def reply_dhcp6(node, addr, cfg, packet, cfd, profile, sock, niccfg=None):
-    if _tenant_net() is not None:
-        return  # an HTTP boot offer: deployment is not in tenant networks yet
     myaddrs = await netutil.get_my_addresses(addr[-1], socket.AF_INET6)
     if not myaddrs:
         log.log({'info': 'Unable to provide IPv6 boot services to {0}, no viable IPv6 configuration on interface index "{1}" to respond through.'.format(node, addr[-1])})
@@ -787,14 +804,15 @@ async def reply_dhcp4(node, info, packet, cfg, reqview, httpboot, cfd, profile, 
     if info.get('architecture', None) is None:
         isboot = False
     rqtype = packet[53][0]
-    if isboot and _tenant_net() is not None:
-        # Boot offers point at deployment services, which tenant networks
-        # do not have yet. Addresses are still assigned to nodes that ask
-        # with plain DHCP.
+    if (isboot and _tenant_net() is not None and not httpboot
+            and packet.get(77, None) != b'iPXE'):
+        # Firmware PXE fetches its boot file by TFTP, which is not served
+        # in tenant networks: UEFI HTTP boot and iPXE are.
         if rqtype == 1 and time.time() > ignoremacs.get(info['hwaddr'], 0) + 90:
             ignoremacs[info['hwaddr']] = time.time()
-            log.log({'info': 'Network boot attempt by {0} within a tenant; '
-                             'network boot is not yet available to tenants'.format(node)})
+            log.log({'info': 'PXE boot attempt by {0} within a tenant; boot by '
+                             'TFTP is not available to tenants, use UEFI HTTP '
+                             'boot or iPXE'.format(node)})
         return
     if isboot:
         insecuremode = cfd.get(node, {}).get('deployment.useinsecureprotocols',
@@ -872,19 +890,19 @@ async def reply_dhcp4(node, info, packet, cfg, reqview, httpboot, cfd, profile, 
     if isboot and httpboot:
         proto = 'https' if insecuremode == 'never' else 'http'
         if (proto == 'http'
-                and os.path.exists('/var/lib/confluent/public/os/{}/boot.ipxe.shim'.format(profile))
-                and os.path.exists('/var/lib/confluent/public/ipxe/ipxe-shim.efi')):
+                and os.path.exists(_public('os', profile, 'boot.ipxe.shim'))
+                and os.path.exists(_public('ipxe', 'ipxe-shim.efi'))):
             bootfile = '{0}://{1}/confluent-public/ipxe/ipxe-shim.efi'.format(
                 proto, myipn
             )
             bootshorturl = '/confluent-public/ipxe/ipxe-shim.efi'
-            bootfilename = '/var/lib/confluent/public/ipxe/ipxe-shim.efi'
+            bootfilename = _public('ipxe', 'ipxe-shim.efi')
         else:
             bootfile = '{0}://{1}/confluent-public/os/{2}/boot.img'.format(
                 proto, myipn, profile
             )
             bootshorturl = '/confluent-public/os/{0}/boot.img'.format(profile)
-            bootfilename = '/var/lib/confluent/public/os/{0}/boot.img'.format(profile)
+            bootfilename = _public('os', profile, 'boot.img')
             can302 = False
         if not isinstance(bootfile, bytes):
             bootfile = bootfile.encode('utf8')
@@ -906,7 +924,7 @@ async def reply_dhcp4(node, info, packet, cfg, reqview, httpboot, cfd, profile, 
             if not profile:
                 log.log({'info': 'No pending profile for {0}, skipping proxyDHCP reply'.format(node)})
                 return
-            if not os.path.exists('/var/lib/confluent/public/os/{0}/boot.ipxe.shim'.format(profile)):
+            if not os.path.exists(_public('os', profile, 'boot.ipxe.shim')):
                 bootfile = 'http://{0}/confluent-public/os/{1}/boot.ipxe'.format(myipn, profile).encode('utf8')
             else:
                 bootfile = 'http://{0}/confluent-public/os/{1}/boot.ipxe.shim'.format(myipn, profile).encode('utf8')

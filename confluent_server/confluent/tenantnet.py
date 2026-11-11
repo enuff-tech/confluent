@@ -31,6 +31,7 @@ registered for that tenant (inode of /run/netns/cf-<id>).
 import array
 import asyncio
 import collections
+import contextvars
 import ipaddress
 import json
 import os
@@ -513,6 +514,17 @@ def aiohttp_connector():
     except TypeError:
         raise TenantNetworkUnsupported(
             'reaching a tenant network over HTTPS needs aiohttp 3.12 or later')
+
+
+async def outside_tenant(coro):
+    """Run coro for the service itself, outside any tenant, and return
+    its result.
+
+    Only for facts about the host that involve nothing of a tenant's (its
+    time zone, say), when a tenant's task needs them: a tenant's own task
+    may not start processes or use the host's network.
+    """
+    return await contextvars.Context().run(asyncio.ensure_future, coro)
 
 
 class TenantNetworkUnsupported(TenantNetworkError):

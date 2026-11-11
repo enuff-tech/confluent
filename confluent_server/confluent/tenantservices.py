@@ -18,8 +18,12 @@ Each active tenant gets its own listeners, on sockets its network broker
 opens in its namespace:
 
 * HTTPS (443), with a certificate of the tenant's own authority, serving
-  the node self-service API (/confluent-api/self/...) as the web server in
-  front of the service does for the default tenant.
+  the node self-service API (/confluent-api/self/...) and the tenant's
+  deployment content (/confluent-public/..., from the tenant's own tree),
+  as the web server in front of the service does for the default tenant.
+* HTTP (80), for the deployment content only: firmware and boot loaders
+  that cannot validate a certificate fetch boot files there. The node API
+  is never served without TLS.
 * The credential server (13001), where a node presents the API key it
   wants to use.
 
@@ -36,13 +40,16 @@ from aiohttp import web
 
 import confluent.config.configmanager as configmanager
 import confluent.credserver as credserver
+import confluent.discovery.protocols.pxe as pxe
 import confluent.log as log
 import confluent.selfservice as selfservice
 import confluent.tasks as tasks
 import confluent.tenantca as tenantca
 import confluent.tenantnet as tenantnet
+import confluent.tenantpaths as tenantpaths
 
 HTTPS_PORT = 443
+HTTP_PORT = 80
 CRED_PORT = 13001
 RETRY = 30
 _services = {}
@@ -146,7 +153,41 @@ def _plain(address):
     return address
 
 
-def _handler(tenant):
+async def _content(tenant, request, relative):
+    """Deployment content of the tenant: a file of its public tree, or
+    one of the two things generated for it (its authority's certificate
+    and the identity of the service as its nodes know it)."""
+    if request.method not in ('GET', 'HEAD'):
+        return web.Response(status=405, text='Method Not Allowed')
+    if relative == 'site/tls/ca.pem':
+        return web.Response(body=await tenantca.ca_pem(tenant),
+                            content_type='application/x-pem-file')
+    if relative == 'site/confluent_uuid':
+        return web.Response(
+            text=configmanager.ConfigManager(tenant).service_uuid() + '\n')
+    found = tenantpaths.contained_file(tenantpaths.public_root(tenant), relative)
+    if found is None:
+        return web.Response(status=404, text='Not Found')
+    return web.FileResponse(found)
+
+
+async def _short_url(tenant, request, urlid):
+    # boot file names too long for a DHCP reply are offered under a short
+    # name (see pxe.register_shorturl)
+    target, redirect, relative, _ = pxe.shorturls.get(urlid, (None, None, None, None))
+    if not target:
+        return web.Response(status=404, text='Not Found')
+    if redirect:
+        return web.Response(status=302, headers={'Location': target})
+    prefix = '/confluent-public/'
+    if not relative or not relative.startswith(prefix):
+        return web.Response(status=404, text='Not Found')
+    return await _content(tenant, request, relative[len(prefix):])
+
+
+def _handler(tenant, tls_only=True):
+    """The request handler of a tenant's listeners. The node API is only
+    answered over TLS (tls_only is for exercising it without)."""
     async def handle(request):
         # The tenant is this listener's: nothing in the request selects it.
         tenantnet.enter(tenant)
@@ -168,10 +209,19 @@ def _handler(tenant):
             return rsp
 
         path = request.rel_url.path
-        if path.startswith('/confluent-api/'):
-            path = path[len('/confluent-api'):]
-        if not path.startswith('/self/'):
-            # only what nodes need is served in a tenant's network
+        try:
+            if path.startswith('/confluent-public/'):
+                return await _content(tenant, request, path[len('/confluent-public/'):])
+            if path.startswith('/confluent-api/'):
+                path = path[len('/confluent-api'):]
+            if path.startswith('/boot/su/'):
+                return await _short_url(tenant, request, path.split('/')[3])
+        except Exception:
+            log.logtrace()
+            return web.Response(status=500, text='Internal Server Error')
+        if not path.startswith('/self/') or (tls_only and not request.secure):
+            # only what nodes need is served in a tenant's network, and
+            # their API only where they can tell who is answering
             return await make_response('text/plain', 404, 'Not Found', body='Not Found')
         peer = request.transport.get_extra_info('peername') or ('',)
         local = request.transport.get_extra_info('sockname') or ('',)
@@ -243,6 +293,8 @@ async def _serve(tenant, state):
             sock = net.listen_tcp(HTTPS_PORT, family)
             state['servers'].append(await loop.create_server(
                 runner.server, sock=sock, ssl=context))
+            sock = net.listen_tcp(HTTP_PORT, family)
+            state['servers'].append(await loop.create_server(runner.server, sock=sock))
             sock = net.listen_tcp(CRED_PORT, family)
             state['sockets'].append(sock)
             state['tasks'].append(tasks.spawn_task(_accept_credentials(tenant, sock)))
