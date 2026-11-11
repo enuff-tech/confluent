@@ -1,10 +1,9 @@
 # Packages needed to run confluent_server/tests outside a packaged install.
 # Runtime dependencies mirror Requires: in confluent_server.spec.tmpl.
-pytest
-pytest-asyncio
 aiohttp
 asyncssh
 cryptography
+libarchive-c
 lxml
 msgpack
 netifaces
@@ -12,6 +11,8 @@ pyasn1
 pyOpenSSL
 pyparsing
 pysnmp
+pytest
+pytest-asyncio
 python-dateutil
 PyYAML
 yarl

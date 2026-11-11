@@ -150,7 +150,11 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - name: Install test dependencies
-        run: python -m pip install -r confluent_server/tests/requirements.txt
+        # libarchive-c (imported by the HTTP API through osimage) loads the
+        # system libarchive.
+        run: |
+          sudo apt-get install -y --no-install-recommends libarchive13t64
+          python -m pip install -r confluent_server/tests/requirements.txt
       - name: Run tests
         working-directory: confluent_server
         run: python -m pytest
