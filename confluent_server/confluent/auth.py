@@ -166,6 +166,8 @@ _tenant_paths = [re.compile(p) for p in (
     # its network, logged in its own log tree).
     r'^/nodes/[^/]+/console/session(/.*)?$',
     r'^/nodes/[^/]+/shell/sessions(/.*)?$',
+    # Its own OS images and deployment profiles (its own trees).
+    r'^/deployment(/.*)?$',
 )]
 
 

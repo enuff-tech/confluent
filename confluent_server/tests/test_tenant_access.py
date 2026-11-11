@@ -216,7 +216,7 @@ async def test_enrollment_http_body(mt):
     ('/networking/neighbors/by-switch/', 'retrieve', True),
     ('/events/decode', 'update', True),
     ('/nodes/c1/events/hardware/decode', 'update', True),
-    ('/deployment/profiles/', 'retrieve', False),
+    ('/deployment/profiles/', 'retrieve', True),
     ('/events/hardware/decode', 'update', False),
     ('/tenants/', 'retrieve', False),
     ('/platform/multitenancy', 'update', False),

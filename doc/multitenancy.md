@@ -103,6 +103,7 @@ that created them and carry scopes, an expiry and can be revoked.
 | Consoles and shell sessions | Yes: `ipmi`, `redfish`, `openbmc`, `tsmsol` consoles, ssh shells |
 | Alert decoding (`/events/decode`) | Yes, for its own nodes |
 | Network boot and deployment | UEFI HTTP boot and iPXE from the tenant's own content; see Deployment |
+| OS images and profiles (`/deployment`) | Yes, tenant administrators: import from the tenant's media directory, list, rebuild boot files, rebase |
 | Firmware updates, media, licenses, certificate signing for BMCs, power reseat | Not yet |
 | Remote configuration (ansible, file synchronization), SSH certificates, identity images | Not yet |
 | The web interface | Default tenant only |
@@ -174,12 +175,34 @@ A tenant's nodes are served inside the tenant's network:
 
 A node never names its tenant: it is the one whose listener it reached.
 
-The tenant's content lives in `/var/lib/confluent/tenants/<id>/public`
-and `.../private`, laid out like `/var/lib/confluent/public` and
-`private`. Nothing outside these trees is served for the tenant, also not
-through symbolic links. The certificate authority is at
-`/confluent-public/site/tls/ca.pem`. **Importing OS images into a tenant's
-tree is not automated yet**: the tree has to be populated on the host.
+The tenant's content lives under `/var/lib/confluent/tenants/<id>/`:
+`public` and `private`, laid out like `/var/lib/confluent/public` and
+`private`, `distributions` for imported media, and `media` for media
+waiting to be imported. What is served for the tenant is its public tree;
+a link in it may lead into its own imported media or into the product's
+packaged content (`/opt/confluent`), and nowhere else. The site content
+(`public/site`: the tenant's certificate authority, the identity of the
+service as its nodes know it, and both packed for the boot images) is
+made by the service. The certificate authority is also at
+`/confluent-public/site/tls/ca.pem`.
+
+A tenant administrator imports OS installation media and manages the
+profiles made from them through `/deployment`, as in a single-tenant
+installation:
+
+    POST /deployment/importing/        {"filename": "Rocky-9.4-x86_64-dvd.iso"}
+    GET  /deployment/importing/<name>
+    GET  /deployment/profiles/
+    PUT  /deployment/profiles/<name>   {"updateboot": 1}
+    PUT  /deployment/profiles/<name>   {"rebase": 1}
+
+`filename` names a file in the tenant's `media` directory, never a path
+of the host. The tools this takes (unpacking media, building boot images)
+run as the service itself, on the tenant's trees only. Ready-made profile
+archives are not imported within a tenant, and rebasing only copies from
+the product's packaged profile content. Profiles are not editable through
+the API: customizing one (kernel arguments, scripts) is done in the
+tenant's tree on the host.
 
 Nodes with a pending deployment are offered UEFI HTTP boot, or iPXE, from
 the tenant's content. Firmware PXE needs TFTP, which is not served in
@@ -230,9 +253,11 @@ turned on.
 
 - The host's root user and the confluent service user can see everything
   (see Security boundaries).
-- Tenants cannot import OS images or manage deployment profiles through
-  the API; firmware updates, media, remote configuration, SSH
+- A tenant's media has to be placed in its media directory on the host,
+  and its profiles are customized there: neither can be done through the
+  API yet. Firmware updates, virtual media, remote configuration, SSH
   certificates and identity images are not available to tenants.
+- Each tenant keeps its own copy of the OS images it imports.
 - TFTP boot is not available to tenants.
 - A tenant's server certificate is issued when its listeners start
   (valid 90 days) and is not renewed without a restart of the service or

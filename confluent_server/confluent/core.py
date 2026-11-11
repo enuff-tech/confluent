@@ -50,6 +50,8 @@ import confluent.networking.macmap as macmap
 import confluent.networking.tenantnetcfg as tenantnetcfg
 import confluent.noderange as noderange
 import confluent.osimage as osimage
+import confluent.tenantpaths as tenantpaths
+import confluent.tenantsite as tenantsite
 import confluent.plugin as plugin
 try:
     import confluent.shellmodule as shellmodule
@@ -198,6 +200,14 @@ async def handle_storage(configmanager, inputdata, pathcomponents, operation):
 
 async def handle_deployment(configmanager, inputdata, pathcomponents,
                       operation):
+    # Everything here works on the deployment trees of the tenant of the
+    # request (osimage.image_base); names are single path components.
+    for name in pathcomponents[2:3]:
+        if pathcomponents[1] in ('profiles', 'distributions', 'importing') and name:
+            osimage.safe_name(name)
+    if configmanager.tenant is not None and operation != 'retrieve':
+        # its site content (authority, identity) before anything is built
+        await tenantsite.ensure(configmanager.tenant)
     if len(pathcomponents) == 1:
         yield msg.ChildCollection('distributions/')
         yield msg.ChildCollection('profiles/')
@@ -223,7 +233,13 @@ async def handle_deployment(configmanager, inputdata, pathcomponents,
         if len(pathcomponents) == 4:
             if operation == 'retrieve':
                 if len(pathcomponents) == 4 and pathcomponents[-1] == 'info':
-                    with open('/var/lib/confluent/public/os/{}/profile.yaml'.format(profname)) as profyaml:
+                    try:
+                        profyaml = open(os.path.join(
+                            tenantpaths.public_root(configmanager.tenant), 'os',
+                            profname, 'profile.yaml'))
+                    except OSError:
+                        raise exc.NotFoundException('No such profile')
+                    with profyaml:
                         profinfo = yaml.safe_load(profyaml)
                         profinfo['name'] = profname
                     #check if boot.ipxe is older than profile.yaml
@@ -234,12 +250,13 @@ async def handle_deployment(configmanager, inputdata, pathcomponents,
                 yield msg.ChildCollection('info')
             if operation == 'update':
                 if 'updateboot' in inputdata:
-                    await osimage.update_boot(profname)
+                    await osimage.host_task(osimage.update_boot(profname))
                     yield msg.KeyValueData({'updated': profname})
                     return
                 elif 'rebase' in inputdata:
                     try:
-                        updated, customized = await osimage.rebase_profile(profname)
+                        updated, customized = await osimage.host_task(
+                            osimage.rebase_profile(profname))
                     except osimage.ManifestMissing:
                         raise exc.InvalidArgumentException('Specified profile {0} does not have a manifest.yaml for rebase'.format(profname))
                     for upd in updated:
