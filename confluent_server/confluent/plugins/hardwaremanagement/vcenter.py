@@ -4,6 +4,7 @@ import codecs
 import confluent.util as util
 import confluent.messages as msg
 import confluent.tasks as tasks
+import confluent.tenantnet as tenantnet
 import struct
 import ssl
 
@@ -51,8 +52,14 @@ class VmConsole(conapi.Console):
                 sslctx = ssl.create_default_context()
                 sslctx.check_hostname = False
                 sslctx.verify_mode = ssl.CERT_NONE
-                self.reader, self.writer = await asyncio.open_connection(
-                    self.host, self.port, ssl=sslctx)
+                # A tenant's host is reached through the tenant's network.
+                tenantsock = await tenantnet.aconnect(self.host, self.port)
+                if tenantsock is not None:
+                    self.reader, self.writer = await asyncio.open_connection(
+                        sock=tenantsock, ssl=sslctx, server_hostname=self.host)
+                else:
+                    self.reader, self.writer = await asyncio.open_connection(
+                        self.host, self.port, ssl=sslctx)
                 # The above disables default validation, replaced by
                 # known-hosts style cert validation below
                 sslobj = self.writer.get_extra_info('ssl_object')
@@ -62,8 +69,13 @@ class VmConsole(conapi.Console):
                     await self.writer.wait_closed()
                     raise pygexc.UnrecognizedCertificate('Unknown certificate', bincert)
             else:
-                self.reader, self.writer = await asyncio.open_connection(
-                    self.host, self.port)
+                tenantsock = await tenantnet.aconnect(self.host, self.port)
+                if tenantsock is not None:
+                    self.reader, self.writer = await asyncio.open_connection(
+                        sock=tenantsock)
+                else:
+                    self.reader, self.writer = await asyncio.open_connection(
+                        self.host, self.port)
         except Exception:
             await callback(conapi.ConsoleEvent.Disconnect)
             return

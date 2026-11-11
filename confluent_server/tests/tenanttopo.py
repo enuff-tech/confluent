@@ -98,6 +98,46 @@ async def main():
 asyncio.run(main())
 '''
 
+SSH = r'''
+import asyncio, sys
+import asyncssh
+label, user, password, ready = sys.argv[1:5]
+class Server(asyncssh.SSHServer):
+    def begin_auth(self, username):
+        return True
+    def password_auth_supported(self):
+        return True
+    def validate_password(self, username, pw):
+        return username == user and pw == password
+async def handle(process):
+    process.stdout.write(label + '\n')
+    process.exit(0)
+async def main():
+    key = asyncssh.generate_private_key('ssh-ed25519')
+    await asyncssh.create_server(Server, '0.0.0.0', 22, server_host_keys=[key],
+                                 process_factory=handle)
+    open(ready, 'w').close()
+    await asyncio.Event().wait()
+asyncio.run(main())
+'''
+
+HTTP = r'''
+import http.server, sys
+label, ready = sys.argv[1:3]
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = label.encode()
+        self.send_response(200)
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *args):
+        pass
+server = http.server.HTTPServer(('0.0.0.0', 80), Handler)
+open(ready, 'w').close()
+server.serve_forever()
+'''
+
 CLIENT = r'''
 import array, json, socket, struct, sys
 path = sys.argv[1]
@@ -197,6 +237,19 @@ class Topology(object):
         ready = os.path.join(self.dir, 'https-ready-' + tid)
         self.netns.spawn(self.lan[tid], sys.executable, '-c', HTTPS,
                          TENANTS[tid][0], cert, key, ready)
+        wait(lambda: os.path.exists(ready))
+
+    def start_ssh(self, tid):
+        """A fake SSH server at HW_IP:22 that prints its tenant's label."""
+        ready = os.path.join(self.dir, 'ssh-ready-' + tid)
+        self.netns.spawn(self.lan[tid], sys.executable, '-c', SSH, TENANTS[tid][0],
+                         BMC_USER, BMC_PASSWORD, ready)
+        wait(lambda: os.path.exists(ready))
+
+    def start_http(self, tid):
+        """A plain HTTP server at HW_IP:80 that answers with the label."""
+        ready = os.path.join(self.dir, 'http-ready-' + tid)
+        self.netns.spawn(self.lan[tid], sys.executable, '-c', HTTP, TENANTS[tid][0], ready)
         wait(lambda: os.path.exists(ready))
 
     def socket_path(self, tid):

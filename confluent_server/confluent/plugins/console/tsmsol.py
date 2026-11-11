@@ -25,6 +25,7 @@ import confluent.exceptions as cexc
 import confluent.interface.console as conapi
 import confluent.log as log
 import confluent.tasks as tasks
+import confluent.tenantnet as tenantnet
 import confluent.util as util
 import aiohmi.exceptions as pygexc
 import aiohmi.redfish.command as rcmd
@@ -146,7 +147,8 @@ class TsmConsole(conapi.Console):
         except Exception as e:
             raise cexc.TargetEndpointUnreachable(str(e))
         self.ssl = CustomVerifier(kv)
-        self.clisess = aiohttp.ClientSession(cookie_jar=wc.cookies)
+        self.clisess = aiohttp.ClientSession(
+            cookie_jar=wc.cookies, connector=tenantnet.aiohttp_connector())
         try:
             self.ws = await self.clisess.ws_connect(
                 'wss://{0}/sol?CSRFTOKEN={1}'.format(self.bmc, rcoem.csrftok),

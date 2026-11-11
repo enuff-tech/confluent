@@ -925,7 +925,10 @@ class BadPlugin(object):
 
 # Plugins that act on a tenant's hardware through the tenant's own network.
 # Others would act from the host's network and are refused for tenants.
-TENANT_PLUGINS = frozenset(['ipmi', 'redfish', 'null'])
+TENANT_PLUGINS = frozenset([
+    'ipmi', 'redfish', 'null',
+    'affluent', 'cnos', 'cooltera', 'deltapdu', 'eatonpdu', 'enlogic', 'enos',
+    'geist', 'nxos', 'proxmox', 'raritan', 'srlinux', 'vcenter'])
 # Fixed handlers a tenant may reach (configuration only).
 TENANT_HANDLERS = frozenset(['attributes'])
 

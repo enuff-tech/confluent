@@ -24,6 +24,7 @@ import hashlib
 import json
 import time
 import socket
+import confluent.tenantnet as tenantnet
 
 
 def simplify_name(name):
@@ -105,17 +106,27 @@ class PlainWebConnection(httplib.HTTPConnection):
         self.stdheaders = dict(_fixedheaders)
         self.cookies = {}
 
+    @staticmethod
+    def _limit_segment(sock):
+        try:
+            # workaround problems of too large mtu, moderately frequent
+            # occurance in this space
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_MAXSEG, 1456)
+        except socket.error:
+            pass
+
     def connect(self):
+        # A tenant's PDU is reached through the tenant's own network.
+        tenantsock = tenantnet.connect_blocking(self.host, self.port, self.timeout,
+                                                setup=self._limit_segment)
+        if tenantsock is not None:
+            self.sock = tenantsock
+            return
         addrinfo = socket.getaddrinfo(self.host, self.port, 0,
                                       socket.SOCK_STREAM)[0]
         plainsock = socket.socket(addrinfo[0])
         plainsock.settimeout(self.timeout)
-        try:
-            # workaround problems of too large mtu, moderately frequent
-            # occurance in this space
-            plainsock.setsockopt(socket.IPPROTO_TCP, socket.TCP_MAXSEG, 1456)
-        except socket.error:
-            pass
+        self._limit_segment(plainsock)
         plainsock.connect(addrinfo[4])
         self.sock = plainsock
 

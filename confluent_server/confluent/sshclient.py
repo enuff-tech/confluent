@@ -20,6 +20,7 @@ with warnings.catch_warnings():
     import asyncssh
     import asyncssh.known_hosts as known_hosts
 import confluent.tasks as tasks
+import confluent.tenantnet as tenantnet
 import hashlib
 
 _hashes = {'sha256': hashlib.sha256, 'sha384': hashlib.sha384, 'sha512': hashlib.sha512}
@@ -38,6 +39,11 @@ class _MyClient(asyncssh.SSHClient):
         self.confluent_configmanager = configmanager
 
     def validate_host_ca_key(self, host, addr, port, key):
+        cfg = getattr(self, 'confluent_configmanager', None)
+        if cfg is not None and cfg.tenant is not None:
+            # The host's SSH CA vouches for the host's nodes, not a tenant's;
+            # tenants rely on the host keys recorded in their own nodes.
+            return False
         kh = None
         with open('/etc/ssh/ssh_known_hosts', 'r') as skh:
             kh = known_hosts.import_known_hosts(skh.read())
@@ -135,7 +141,40 @@ def connect(target, context=None, disable_hostkey_validation=False, known_hosts=
         known_hosts=known_hosts,
         login_timeout=login_timeout,
         connect_timeout=connect_timeout)
+    if tenantnet.current_network() is not None:
+        return _TenantConnect(target, connect_timeout, dict(kwargs, options=sco))
     return asyncssh.connect(target, options=sco, **kwargs)
+
+
+class _TenantConnect(object):
+    """asyncssh.connect over a socket of the current tenant's network.
+    Like asyncssh.connect, it can be awaited or used with 'async with'."""
+
+    def __init__(self, target, timeout, kwargs):
+        self.target = target
+        self.port = kwargs.pop('port', 22)
+        self.timeout = timeout
+        self.kwargs = kwargs
+        self.conn = None
+
+    async def _open(self):
+        sock = await tenantnet.aconnect(self.target, self.port, timeout=self.timeout)
+        try:
+            self.conn = await asyncssh.connect(self.target, sock=sock, **self.kwargs)
+        except BaseException:
+            sock.close()
+            raise
+        return self.conn
+
+    def __await__(self):
+        return self._open().__await__()
+
+    async def __aenter__(self):
+        return await self._open()
+
+    async def __aexit__(self, *exc_info):
+        self.conn.close()
+        await self.conn.wait_closed()
 
 
 async def get_ssh_banner(target):

@@ -21,6 +21,7 @@ import aiohmi.util.webclient as webclient
 import confluent.messages as msg
 import confluent.tasks as tasks
 import confluent.util as util
+import confluent.tenantnet as tenantnet
 
 class SwitchSensor(object):
     def __init__(self, name, states, value=None, health=None):
@@ -80,6 +81,8 @@ async def renotify_me(node, configmanager, myname):
 async def subscribe_discovery(node, configmanager, myname):
     creds = configmanager.get_node_attributes(
         node, ['secret.hardwaremanagementuser', 'secret.hardwaremanagementpassword'], decrypt=True)
+    # Registers this server for discovery, which tenants do not have yet.
+    tenantnet.refuse_for_tenant('Discovery subscription')
     tsock = socket.create_connection((node, 443))
     myip = tsock.getsockname()[0]
     tsock.close()

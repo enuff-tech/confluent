@@ -103,6 +103,64 @@ async def test_web_connections_stay_in_their_own_network(topo):
     assert topo.decoy_hits() == hits
 
 
+async def test_ssh_reaches_the_tenants_own_host(topo):
+    import confluent.sshclient as sshclient
+    hits = topo.decoy_hits()
+    for tid in TENANTS:
+        topo.start_ssh(tid)
+    for tid, (label, _) in TENANTS.items():
+        tenantnet.enter(tid)
+        try:
+            # awaited, as the shell plugin does
+            conn = await sshclient.connect(HW_IP, username=BMC_USER, password=BMC_PASSWORD,
+                                           disable_hostkey_validation=True)
+            assert (await conn.run('whoami')).stdout.strip() == label
+            conn.close()
+            # and as a context manager, as discovery handlers do
+            async with sshclient.connect(HW_IP, username=BMC_USER, password=BMC_PASSWORD,
+                                         disable_hostkey_validation=True) as conn:
+                assert (await conn.run('whoami')).stdout.strip() == label
+        finally:
+            tenantnet.enter(None)
+    assert topo.decoy_hits() == hits
+
+
+async def test_blocking_http_clients_reach_the_tenants_own_pdu(topo):
+    import confluent.plugins.hardwaremanagement.deltapdu as deltapdu
+    import confluent.plugins.hardwaremanagement.eatonpdu as eatonpdu
+    hits = topo.decoy_hits()
+    for tid in TENANTS:
+        topo.start_http(tid)
+
+    def fetch(conn):
+        conn.request('GET', '/')
+        return conn.getresponse().read().decode()
+    for tid, (label, _) in TENANTS.items():
+        tenantnet.enter(tid)
+        try:
+            # blocking clients run in executor threads, which carry the tenant
+            assert await asyncio.to_thread(fetch, deltapdu.WebConnection(HW_IP)) == label
+            assert await asyncio.to_thread(fetch, eatonpdu.PlainWebConnection(HW_IP)) == label
+        finally:
+            tenantnet.enter(None)
+    assert topo.decoy_hits() == hits
+
+
+async def test_own_aiohttp_sessions_use_the_tenant_network(topo):
+    import aiohttp
+    for tid in TENANTS:
+        topo.start_https(tid)
+    for tid, (label, _) in TENANTS.items():
+        tenantnet.enter(tid)
+        try:
+            async with aiohttp.ClientSession(connector=tenantnet.aiohttp_connector()) as sess:
+                async with sess.get('https://{0}/'.format(HW_IP), ssl=False) as rsp:
+                    assert (await rsp.json())['label'] == label
+        finally:
+            tenantnet.enter(None)
+    assert tenantnet.aiohttp_connector() is None  # default tenant: aiohttp's own
+
+
 async def _node_power(tid, node='c1'):
     cfm = configmanager.ConfigManager(tid)
     tenantnet.enter(tid)
@@ -127,7 +185,7 @@ async def nodes(topo):
                    'secret.hardwaremanagementuser': BMC_USER,
                    'secret.hardwaremanagementpassword': BMC_PASSWORD},
             'p1': {'hardwaremanagement.manager': HW_IP,
-                   'hardwaremanagement.method': 'proxmox'},
+                   'hardwaremanagement.method': 'enclosure'},
         }, autocreate=True)
     return topo
 
@@ -148,7 +206,7 @@ async def test_power_state_through_confluent(nodes):
 
 async def test_plugins_not_ported_are_refused_for_tenants(nodes):
     hits = nodes.decoy_hits()
-    with pytest.raises(Exception, match='proxmox is not yet available within a tenant'):
+    with pytest.raises(Exception, match='enclosure is not yet available within a tenant'):
         await _node_power(A, 'p1')
     assert nodes.decoy_hits() == hits
 

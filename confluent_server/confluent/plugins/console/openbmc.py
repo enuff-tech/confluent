@@ -25,6 +25,7 @@ import confluent.exceptions as cexc
 import confluent.interface.console as conapi
 import confluent.log as log
 import confluent.tasks as tasks
+import confluent.tenantnet as tenantnet
 import confluent.util as util
 import aiohmi.exceptions as pygexc
 import aiohmi.util.webclient as webclient
@@ -146,7 +147,8 @@ class OpenBmcConsole(conapi.Console):
         if rsp[1] > 400:
             raise cexc.TargetEndpointBadCredentials
         self.ssl = CustomVerifier(kv)
-        self.clisess = aiohttp.ClientSession(cookie_jar=wc.cookies)
+        self.clisess = aiohttp.ClientSession(
+            cookie_jar=wc.cookies, connector=tenantnet.aiohttp_connector())
         protos = []
         for ck in wc.cookies:
             if ck.key == 'XSRF-TOKEN':

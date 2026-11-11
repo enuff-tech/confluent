@@ -7,6 +7,7 @@ import confluent.vinzmanager as vinzmanager
 import confluent.util as util
 import confluent.messages as msg
 import confluent.tasks as tasks
+import confluent.tenantnet as tenantnet
 import aiohmi.util.webclient as webclient
 import aiohmi.exceptions as pygexc
 import confluent.interface.console as conapi
@@ -285,7 +286,8 @@ class PmxConsole(conapi.Console):
             cookies.update_cookies({'PVEAuthCookie': pac})
         if self.consdata.get('authorization'):
             headers['Authorization'] = self.consdata['authorization']
-        self.clisess = aiohttp.ClientSession(cookie_jar=cookies)
+        self.clisess = aiohttp.ClientSession(
+            cookie_jar=cookies, connector=tenantnet.aiohttp_connector())
         try:
             self.ws = await self.clisess.ws_connect(
                 f'wss://{self.bmc}:8006/api2/json/nodes/{host}/{guest}/vncwebsocket?port={port}&vncticket={urlticket}',
