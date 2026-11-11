@@ -155,6 +155,12 @@ _tenant_paths = [re.compile(p) for p in (
     # The tenant's own discovery: what it has detected, manual
     # registration, rescan and autosense (all kept per tenant).
     r'^/discovery(/.*)?$',
+    # The tenant's own switches: MAC tables and LLDP neighbors, read
+    # through its network with its own credentials.
+    r'^/networking(/.*)?$',
+    # Decoding an alert (SNMP trap contents) of one of its own nodes.
+    r'^/events(/decode)?/?$',
+    r'^/(nodes|noderange)/[^/]+/events/hardware/decode$',
 )]
 
 

@@ -49,7 +49,8 @@ async def decode_alert(varbinds, configmanager):
         agentaddr = varbinds['.1.3.6.1.6.3.18.1.3.0']
     except KeyError:
         agentaddr = varbinds['1.3.6.1.6.3.18.1.3.0']
-    node = await lookuptools.node_by_manager(agentaddr)
+    # among the nodes of the tenant the request works for
+    node = await lookuptools.node_by_manager(agentaddr, configmanager)
     if node is None:
         raise exc.InvalidArgumentException(
             'Unable to find a node with specified manager')

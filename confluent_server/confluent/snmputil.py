@@ -35,9 +35,33 @@ except ImportError:
 
 import pysnmp.hlapi.asyncio as snmp
 
+async def _get_tenant_transport(net, name):
+    """A transport target within a tenant's network: resolved there, and
+    sending through a socket its broker opens in its namespace."""
+    family, sockaddr = (await net.getaddrinfo(name, 161))[0]
+    if family == socket.AF_INET6:
+        base = snmp.Udp6TransportTarget
+    else:
+        base = snmp.UdpTransportTarget
+    if not (hasattr(base, 'create') and hasattr(base, 'open_client_mode')):
+        raise tenantnet.TenantNetworkUnsupported(
+            'SNMP within a tenant needs pysnmp 7 or later')
+
+    class TenantTransportTarget(base):
+        def open_client_mode(self):
+            # pysnmp would make a socket of its own here (in the host's
+            # network); it is given the tenant's instead
+            sock = net.udp_socket(family)
+            self.transport = self.PROTO_TRANSPORT().open_server_mode(sock=sock)
+            return self.transport
+
+    return await TenantTransportTarget.create(sockaddr, timeout=2)
+
+
 async def _get_transport(name):
-    # pysnmp makes its own sockets, so it cannot use a tenant's network yet.
-    tenantnet.refuse_for_tenant('SNMP')
+    net = tenantnet.current_network()
+    if net is not None:
+        return await _get_tenant_transport(net, name)
     # Annoyingly, pysnmp does not automatically determine ipv6 v ipv4
     res = await asyncio.get_running_loop().getaddrinfo(name, 161, type=socket.SOCK_DGRAM)
     if res[0][0] == socket.AF_INET6:
@@ -93,6 +117,13 @@ class Session(object):
                 authProtocol=authproto,
                 privProtocol=privproto)
         self.eng = snmp.SnmpEngine()
+
+    def close(self):
+        """Release the session's socket."""
+        try:
+            self.eng.close_dispatcher()
+        except Exception:
+            pass
 
     async def walk(self, oid):
         """Walk over children of a given OID

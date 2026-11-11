@@ -774,7 +774,7 @@ async def _recheck_nodes_backend(nodeattribs, configmanager):
     # for the nodes whose attributes have changed, consider them as potential
     # strangers
     if nodeattribs:
-        macmap.vintage = 0  # expire current mac map data, in case
+        macmap.expire()  # expire current mac map data, in case
         # the attributes changed impacted the result
     for node in nodeattribs:
         await asyncio.sleep(0)
@@ -1720,7 +1720,7 @@ needaddhandled = False
 async def _handle_nodelist_change(configmanager):
     global needaddhandled
     global nodeaddhandler
-    macmap.vintage = 0  # the current mac map is probably inaccurate
+    macmap.expire()  # the current mac map is probably inaccurate
     await _recheck_nodes((), configmanager)
     if needaddhandled:
         needaddhandled = False

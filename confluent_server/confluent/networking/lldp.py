@@ -40,6 +40,7 @@ import confluent.exceptions as exc
 import confluent.log as log
 import confluent.messages as msg
 import confluent.snmputil as snmp
+import confluent.tenantstate as tenantstate
 import confluent.networking.switchutil as switchutil
 import confluent.util as util
 import confluent.tasks as tasks
@@ -83,11 +84,12 @@ import aiohmi.util.webclient as webclient
 # # 1.0.8802.1.1.2.1.4.1.1.10 - SysDesc - good stuff
 
 
-_neighdata = {}
-_neighbypeerid = {}
-_updatelocks = {}
-_chassisidbyswitch = {}
-_noaffluent = set([])
+# Kept per tenant: every tenant has its own switches and neighbors.
+_neighdata = tenantstate.TenantScoped()
+_neighbypeerid = tenantstate.TenantScoped()
+_updatelocks = tenantstate.TenantScoped()
+_chassisidbyswitch = tenantstate.TenantScoped()
+_noaffluent = tenantstate.TenantScoped()
 
 def lenovoname(idx, desc):
     if desc.isdigit():
@@ -176,7 +178,7 @@ def _init_lldp(data, iname, idx, idxtoportid, switch):
         data[iname] = {'port': iname, 'portid': str(idxtoportid[idx]),
                        'chassisid': _chassisidbyswitch[switch]}
 
-_fastbackends = {}
+_fastbackends = tenantstate.TenantScoped()
 async def detect_backend(switch, verifier):
         backend = _fastbackends.get(switch, None)
         if backend:
@@ -299,10 +301,17 @@ async def _extract_neighbor_data_b(args):
     except Exception:
         pass
     conn = snmp.Session(switch, password, user, privacy_protocol=privproto)
+    try:
+        await _extract_neighbor_data_snmp(conn, switch, user, lldpdata)
+    finally:
+        conn.close()  # and with it, its socket
+
+
+async def _extract_neighbor_data_snmp(conn, switch, user, lldpdata):
     sid = None
     async for sysid in conn.walk('1.3.6.1.2.1.1.2'):
         sid = str(sysid[1][6:])
-    _noaffluent.add(switch)
+    _noaffluent[switch] = True
     idxtoifname = {}
     idxtoportid = {}
     async for cid in conn.walk('1.0.8802.1.1.2.1.3.2'):
@@ -371,14 +380,14 @@ async def update_neighbors(configmanager, force=False, retexc=False):
 
 
 async def _update_neighbors_backend(configmanager, force, retexc):
-    global _neighdata
-    global _neighbypeerid
     vintage = _neighdata.get('!!vintage', 0)
     now = util.monotonic_time()
     if vintage > (now - 60) and not force:
         return
-    _neighdata = {'!!vintage': now}
-    _neighbypeerid = {'!!vintage': now}
+    _neighdata.clear()
+    _neighdata['!!vintage'] = now
+    _neighbypeerid.clear()
+    _neighbypeerid['!!vintage'] = now
     switches = switchutil.list_switches(configmanager)
     switchcreds = switchutil.get_switchcreds(configmanager, switches)
     switchcreds = [ x + (force, retexc) for x in switchcreds]

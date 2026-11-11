@@ -53,7 +53,10 @@ import confluent.exceptions as exc
 import confluent.log as log
 import confluent.messages as msg
 import confluent.noderange as noderange
+import confluent.snmputil as snmp
 import confluent.tasks as tasks
+import confluent.tenantguard as tenantguard
+import confluent.tenantstate as tenantstate
 import confluent.networking.nxapi as nxapi
 import confluent.networking.srlinux as srlinux
 import confluent.util as util
@@ -63,16 +66,40 @@ import re
 import aiohmi.util.webclient as webclient
 
 
-noaffluent = set([])
+# Each tenant has its own switches (names, addresses and MAC addresses may
+# repeat between tenants), so all of this is kept per tenant, built from
+# the tenant's configuration through the tenant's network.
+noaffluent = tenantstate.TenantScoped()
 
-_macmap = {}
-_apimacmap = {}
-_macsbyswitch = {}
-_nodesbymac = {}
-_switchportmap = {}
+_macmap = tenantstate.TenantScoped()
+_apimacmap = tenantstate.TenantScoped()
+_macsbyswitch = tenantstate.TenantScoped()
+_nodesbymac = tenantstate.TenantScoped()
+_switchportmap = tenantstate.TenantScoped()
 _offloadevts = {}
 _offloader = None
-vintage = None
+# 'vintage' (when the map was last built), 'backoff' and the 'lock' held
+# while it is being rebuilt
+_scan = tenantstate.TenantScoped()
+
+
+def expire():
+    """The current tenant's map may be out of date: rebuild on next use."""
+    _scan['vintage'] = 0
+
+
+def _maplock():
+    if 'lock' not in _scan:
+        _scan['lock'] = asyncio.Lock()
+    return _scan['lock']
+
+
+def _check_context(configmanager):
+    # the map is built with one tenant's configuration into the state of
+    # the tenant the task works for: they must be the same
+    if tenantguard.current_tenant.get() != configmanager.tenant:
+        raise exc.ForbiddenRequest(
+            'Network topology of another tenant is not available')
 
 
 _whitelistnames = (
@@ -302,7 +329,6 @@ async def _map_switch_backend(args):
     #  .1.3.6.1.2.1.2.2.1.2 - ifDescr, usually useless, but a
     #   fallback if ifName is empty
     #
-    global _macmap
     switch = args[0] if len(args) > 0 else None
     password = args[1] if len(args) > 1 else None
     user = args[2] if len(args) > 2 else None
@@ -319,8 +345,15 @@ async def _map_switch_backend(args):
                               'expected due to reinstall or new certificate'.format(switch)})
         except Exception:
             pass
-    mactobridge, ifnamemap, bridgetoifmap = await _offload_map_switch(
-        switch, password, user, privprotocol)
+    if tenantguard.current_tenant.get() is not None:
+        # The offload process works in the host's network (and tenant
+        # tasks start no processes): walk the tenant's switch from here,
+        # through the tenant's network.
+        mactobridge, ifnamemap, bridgetoifmap = await _snmp_map_switch(
+            switch, password, user, privprotocol)
+    else:
+        mactobridge, ifnamemap, bridgetoifmap = await _offload_map_switch(
+            switch, password, user, privprotocol)
     maccounts = {}
     bridgetoifvalid = False
     for mac in mactobridge:
@@ -350,7 +383,7 @@ async def _map_switch_backend(args):
             else:
                 maccounts[ifname] += 1
     newmacs = {}
-    noaffluent.add(switch)
+    noaffluent[switch] = True
     for mac in mactobridge:
         # We want to merge it so that when a mac appears in multiple
         # places, it is captured.
@@ -414,9 +447,19 @@ async def _snmp_map_switch_relay(rqid, switch, password, user, privprotocol=None
         sys.stdout.flush()
 
 async def _snmp_map_switch(switch, password, user, privprotocol=None):
+    sessions = []
+    try:
+        return await _snmp_walk_switch(sessions, switch, password, user, privprotocol)
+    finally:
+        for session in sessions:
+            session.close()  # and with it, its socket
+
+
+async def _snmp_walk_switch(sessions, switch, password, user, privprotocol=None):
     haveqbridge = False
     mactobridge = {}
     conn = snmp.Session(switch, password, user, privacy_protocol=privprotocol)
+    sessions.append(conn)
     ifnamemap = await get_portnamemap(conn)
     async for vb in conn.walk('1.3.6.1.2.1.17.7.1.2.2.1.2'):
         haveqbridge = True
@@ -462,6 +505,7 @@ async def _snmp_map_switch(switch, password, user, privprotocol=None):
                 if not isinstance(password, str):
                     password = password.decode('utf8')
                 conn = snmp.Session(switch, '{}@{}'.format(password, vlan))
+            sessions.append(conn)
         async for vb in conn.walk('1.3.6.1.2.1.17.1.4.1.2'):
             bridgeport, ifidx = vb
             bridgeport = int(str(bridgeport).rsplit('.', 1)[1])
@@ -478,25 +522,21 @@ switchbackoff = 30
 
 
 async def find_nodeinfo_by_mac(mac, configmanager):
-    if configmanager.tenant is not None:
-        # The switch map below is the host's; tenants have none yet.
-        return None, {'maccount': 0}
+    _check_context(configmanager)
     now = util.monotonic_time()
+    vintage = _scan.get('vintage')
     if vintage and (now - vintage) < 90 and mac in _nodesbymac:
         return _nodesbymac[mac][0], {'maccount': _nodesbymac[mac][1]}
     # do not actually sweep switches more than once every 30 seconds
     # however, if there is an update in progress, wait on it
     async for _ in update_macmap(configmanager,
-                           vintage and (now - vintage) < switchbackoff):
+                           vintage and (now - vintage) < _scan.get('backoff', switchbackoff)):
         if mac in _nodesbymac:
             return _nodesbymac[mac][0], {'maccount': _nodesbymac[mac][1]}
     # If update_mac bailed out, still check one last time
     if mac in _nodesbymac:
         return _nodesbymac[mac][0], {'maccount': _nodesbymac[mac][1]}
     return None, {'maccount': 0}
-
-
-mapupdating = None
 
 
 async def update_macmap(configmanager, impatient=False):
@@ -507,9 +547,8 @@ async def update_macmap(configmanager, impatient=False):
     recheck the cache as results become possible, rather
     than having to wait for the process to complete to interrogate.
     """
-    global mapupdating
-    if mapupdating is None:
-        mapupdating = asyncio.Lock()
+    _check_context(configmanager)
+    mapupdating = _maplock()
     if mapupdating.locked():
         while mapupdating.locked():
             await asyncio.sleep(1)
@@ -534,26 +573,14 @@ async def _finish_update(completions):
 
 
 async def _full_updatemacmap(configmanager):
-    global vintage
-    global _apimacmap
-    global _macmap
-    global _nodesbymac
-    global _switchportmap
-    global _macsbyswitch
-    global switchbackoff
+    _check_context(configmanager)
     start = util.monotonic_time()
-    global mapupdating
-    if mapupdating is None:
-        mapupdating = asyncio.Lock()
-    async with mapupdating:
-        vintage = util.monotonic_time()
+    async with _maplock():
+        _scan['vintage'] = util.monotonic_time()
         # Clear all existing entries
-        _macmap = {}
-        _nodesbymac = {}
-        _switchportmap = {}
-        if configmanager.tenant is not None:
-            raise exc.ForbiddenRequest(
-                'Network topology not available to tenants')
+        _macmap.clear()
+        _nodesbymac.clear()
+        _switchportmap.clear()
         # here's a list of switches... need to add nodes that are switches
         nodelocations = configmanager.get_node_attributes(
             configmanager.list_nodes(), ('type', 'collective.managercandidates', 'net*.switch', 'net*.switchport'))
@@ -615,14 +642,15 @@ async def _full_updatemacmap(configmanager):
             tsks.append(_map_switch(sa))
         for tsk in asyncio.as_completed(tsks):
             yield await tsk
-    _apimacmap = _macmap
+    _apimacmap.clear()
+    _apimacmap.update(_macmap)
     endtime = util.monotonic_time()
     duration = endtime - start
     duration = duration * 15  # wait 15 times as long as it takes to walk
     # avoid spending a large portion of the time hitting switches with snmp
     # requests
-    if duration > switchbackoff:
-        switchbackoff = duration
+    if duration > _scan.get('backoff', switchbackoff):
+        _scan['backoff'] = duration
 
 
 def _dump_locations(info, macaddr, nodename=None):
@@ -652,8 +680,6 @@ async def handle_api_request(configmanager, inputdata, operation, pathcomponents
 
 
 async def get_node_fingerprints(nodename, configmanager):
-    if configmanager.tenant is not None:
-        return  # switch-based identification is the host's; tenants have none yet
     cfg = configmanager.get_node_attributes(nodename, ['net*.switch',
                                                        'net*.switchport'])
     for attrkey in cfg[nodename]:
@@ -695,7 +721,7 @@ async def handle_read_api_request(pathcomponents, configmanager):
             macaddr = pathcomponents[-1].replace('-', ':')
             return dump_macinfo(macaddr)
     elif pathcomponents[2] == 'alldata':
-        return [msg.KeyValueData(_apimacmap)]
+        return [msg.KeyValueData(dict(_apimacmap))]
     elif pathcomponents[2] == 'by-mac':
         if len(pathcomponents) == 3:
             return [msg.ChildCollection(x.replace(':', '-'))
@@ -745,10 +771,7 @@ async def handle_read_api_request(pathcomponents, configmanager):
         if len(pathcomponents) == 8:
             return dump_macinfo(pathcomponents[-1])
     elif pathcomponents[2] == 'rescan':
-        global mapupdating
-        if mapupdating is None:
-            mapupdating = asyncio.Lock()
-        return [msg.KeyValueData({'scanning': mapupdating.locked()})]
+        return [msg.KeyValueData({'scanning': _maplock().locked()})]
     raise exc.NotFoundException('Unrecognized path {0}'.format(
         '/'.join(pathcomponents)))
 
