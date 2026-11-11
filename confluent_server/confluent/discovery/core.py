@@ -2092,7 +2092,7 @@ def _tenant_state_changed(tenant, state):
         stop_tenant_detection(tenant)
 
 
-cfm.watch_tenant_state(_tenant_state_changed)
+cfm.watch_tenant_state(_tenant_state_changed, first=True)
 
 
 def stop_autosense():

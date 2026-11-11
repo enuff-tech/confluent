@@ -1,4 +1,3 @@
-import asyncio
 import confluent.runansible as runansible
 import confluent.syncfiles as syncfiles
 import confluent.config.configmanager as configmanager
@@ -117,16 +116,35 @@ async def get_extra_names(nodename, cfg, myip=None, preferadjacent=False, addloc
             names.update(routedaddrs)
     return names
 
-async def handle_request(req, make_response, mimetype):
+# What a tenant's nodes may ask for so far. Deployment content, node
+# certificates and remote configuration are not served within tenants yet.
+TENANT_PATHS = frozenset([
+    '/self/bmcconfig', '/self/myattribs', '/self/netcfg', '/self/nodelist',
+    '/self/updatestatus', '/self/saveapikey',
+])
+
+
+async def handle_request(req, make_response, mimetype, tenant=None,
+                         clientip=None, myip=None, reqpath=None):
+    """Answer a node's request about itself.
+
+    For the default tenant the request comes through the web server in
+    front of the service, which reports the addresses in headers. A
+    tenant's nodes reach a listener of their tenant directly: the tenant
+    and both addresses are that connection's (given by the caller), and
+    the forwarding headers are not trusted.
+    """
     global currtz
     global keymap
     global currlocale
     global currtzvintage
     configmanager.check_quorum()
-    cfg = configmanager.ConfigManager(None)
-    reqpath = req.rel_url.path
+    cfg = configmanager.ConfigManager(tenant)
+    if reqpath is None:
+        reqpath = req.rel_url.path
     nodename = req.headers.get('CONFLUENT_NODENAME', req.headers.get('CONFLUENT-NODENAME', None))
-    clientip = req.headers.get('X-Forwarded-For', None)
+    if tenant is None:
+        clientip = req.headers.get('X-Forwarded-For', None)
     if reqpath == '/self/whoami':
         clientids = req.headers.get('CONFLUENT_IDS', req.headers.get('CONFLUENT-IDS', None))
         if not clientids:
@@ -190,13 +208,19 @@ async def handle_request(req, make_response, mimetype):
         return await make_response(mimetype, 401, 'Unauthorized', body='Unauthorized')
     if ea.get(nodename, {}).get('deployment.apiarmed', {}).get('value', None) == 'once':
         await cfg.set_node_attributes({nodename: {'deployment.apiarmed': ''}})
-    myip = req.headers.get('X-Forwarded-Host', None)
-    if myip and ']' in myip:
-        myip = myip.split(']', 1)[0]
-    elif myip:
-        myip = myip.split(':', 1)[0]
-    if myip:
-        myip = myip.replace('[', '').replace(']', '')
+    if tenant is not None:
+        if reqpath not in TENANT_PATHS:
+            return await make_response(
+                mimetype, 501, 'Not Implemented',
+                body='Not available to the nodes of a tenant')
+    else:
+        myip = req.headers.get('X-Forwarded-Host', None)
+        if myip and ']' in myip:
+            myip = myip.split(']', 1)[0]
+        elif myip:
+            myip = myip.split(':', 1)[0]
+        if myip:
+            myip = myip.replace('[', '').replace(']', '')
     retype = req.headers.get('Accept', 'application/yaml')
     isgeneric = False
     if retype == '*/*':
@@ -262,7 +286,7 @@ async def handle_request(req, make_response, mimetype):
         if not bmcaddr:
             return await make_response(mimetype, 500, 'Internal Server Error', body='Missing value in hardwaremanagement.manager')
         bmcaddr = bmcaddr.split('/', 1)[0]
-        bmcaddr = (await asyncio.get_running_loop().getaddrinfo(bmcaddr, 0))[0]
+        bmcaddr = (await netutil._getaddrinfo(bmcaddr, 0))[0]
         bmcaddr = bmcaddr[-1][0]
         if '.' in bmcaddr:  # ipv4 is allowed
             netconfig = await netutil.get_nic_config(cfg, nodename, ip=bmcaddr)
@@ -696,7 +720,9 @@ async def get_cluster_list(nodename=None, cfg=None):
                 'value', None)
         for extraname in await get_extra_names(node, cfg):
             nodes.add(extraname)
-    if autonodes:
+    if autonodes and cfg.tenant is None:
+        # (a tenant's nodes know the service by its address in their
+        # network, not by the names of the hosts it runs on)
         for mgr in configmanager.list_collective():
             nodes.add(mgr)
             if domain and domain not in mgr:
