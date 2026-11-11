@@ -45,6 +45,7 @@ import confluent.consoleserver as consoleserver
 import confluent.core as confluentcore
 import confluent.httpapi as httpapi
 import confluent.log as log
+import confluent.sandbox as sandbox
 import confluent.tenantpaths as tenantpaths
 import confluent.collective.manager as collective
 import linecache
@@ -210,6 +211,27 @@ def request_stop():
     """
     if _stopevent is not None:
         _stopevent.set()
+
+
+def _report_confinement():
+    # What this host lets the service do to confine the programs that
+    # read the media of tenants: told once, to its operator.
+    if not configmanager.get_global('multitenancy.enabled'):
+        return
+    found = sandbox.supported()
+    problems = sandbox.diagnose(found)
+    if not problems:
+        log.service_log({'info': 'Programs reading the media of tenants are confined '
+                                 '({0})'.format(', '.join(found))})
+        return
+    strict = sandbox.required() and 'landlock' not in found
+    for problem in problems:
+        log.service_log({'warning': 'Programs reading the media of tenants are not confined '
+                                    'by {0}: {1} ({2})'.format(
+                                        problem['layer'], problem['reason'], problem['fix'])})
+    if strict:
+        log.service_log({'warning': 'Tenants cannot import media on this server '
+                                    '(media_sandbox = required)'})
 
 
 def _finish_shutdown():
@@ -420,6 +442,10 @@ async def asyncrun(args):
     try:
         # what an interrupted deletion of a tenant left on disk
         await asyncio.to_thread(tenantpaths.finish_deletions)
+    except Exception:
+        log.logtrace()
+    try:
+        _report_confinement()
     except Exception:
         log.logtrace()
     tenantservices.start_all()

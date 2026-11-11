@@ -451,3 +451,23 @@ async def test_profile_content_is_served_from_the_tenants_trees(images):
         for inside in ('images/pxeboot/vmlinuz', 'hostname', 'rocky.iso', 'host.iso'):
             assert served('os/' + name + '/escape/' + inside) is None, (target, inside)
     assert served('../distributions/' + OSNAME + '/distinfo.yaml') is None
+
+
+async def test_media_is_refused_where_confinement_is_required_and_missing(images, monkeypatch):
+    import confluent.sandbox as sandbox
+    await tenantsite.ensure(A)
+    _write(os.path.join(tenantpaths.media_root(A), 'rocky.iso'), b'x')
+    monkeypatch.setattr(sandbox, 'required', lambda: True)
+    monkeypatch.setattr(sandbox, '_supported', [('limits', 'namespaces')])
+    for path in ('/deployment/importing/', '/deployment/fingerprint/'):
+        with pytest.raises(exc.NotImplementedException, match='cannot confine'):
+            await _as(A, path, 'create', {'filename': 'rocky.iso'})
+    # the media was not looked at, by anything
+    assert images['identified'] == [] and images['ran'] == []
+    # not required: handled with what the host has
+    monkeypatch.setattr(sandbox, 'required', lambda: False)
+    await _import(A)
+    # required and there: handled
+    monkeypatch.setattr(sandbox, 'required', lambda: True)
+    monkeypatch.setattr(sandbox, '_supported', [('limits', 'landlock')])
+    await _import(B)

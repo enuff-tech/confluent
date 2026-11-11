@@ -1,0 +1,15 @@
+# AppArmor profile of the confluent service.
+#
+# It restricts nothing: its purpose is to let the service create user
+# namespaces, which distributions that restrict them to profiled programs
+# (Ubuntu 24.04 and later) otherwise refuse. The service uses them to
+# confine the programs that read installation media uploaded by tenants
+# (see confluent/sandbox.py).
+abi <abi/4.0>,
+include <tunables/global>
+
+profile confluent /opt/confluent/bin/confluent flags=(unconfined) {
+  userns,
+
+  include if exists <local/confluent>
+}

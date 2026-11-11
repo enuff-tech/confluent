@@ -43,6 +43,8 @@ CLONE_NEWIPC = 0x08000000
 CLONE_NEWNET = 0x40000000
 MS_NOSUID, MS_NODEV, MS_NOEXEC, MS_REC, MS_PRIVATE = 2, 4, 8, 0x4000, 1 << 18
 PR_SET_NO_NEW_PRIVS = 38
+PR_CAPBSET_DROP = 24
+PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL = 47, 4
 # the same numbers on every architecture Linux has had Landlock on
 SYS_LANDLOCK_CREATE_RULESET, SYS_LANDLOCK_ADD_RULE, SYS_LANDLOCK_RESTRICT_SELF = 444, 445, 446
 LANDLOCK_CREATE_RULESET_VERSION = 1
@@ -211,9 +213,25 @@ def confine(read=(), write=(), report=None, use=('namespaces', 'landlock')):
                 applied.append('landlock')
         except Exception:
             pass
+    _drop_privileges()
     if report is not None:
         os.write(report, ','.join(applied).encode())
     return applied
+
+
+def _drop_privileges():
+    # The service is started with capabilities (to bind low ports, to
+    # send raw packets) that a program it runs would inherit: not this one.
+    try:
+        libc = _libc()
+        libc.prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)
+        libc.prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0)
+        for capability in range(64):
+            # (for a service running as root, which gets back at exec
+            # whatever is left in this set)
+            libc.prctl(PR_CAPBSET_DROP, capability, 0, 0, 0)
+    except Exception:
+        pass
 
 
 def confiner(read=(), write=()):
@@ -238,14 +256,22 @@ def supported():
     return _supported[0]
 
 
-def applied(read=(), write=()):
+def applied(read=(), write=(), user=None):
     """What confine() manages to apply on this host, found out in a
-    process made for it: a list of 'limits', 'namespaces', 'landlock'."""
+    process made for it: a list of 'limits', 'namespaces', 'landlock'.
+
+    user, (uid, gid), is who to find it out for when that is not who
+    asks (root asking on behalf of the service user).
+    """
     receive, send = os.pipe()
     pid = os.fork()
     if pid == 0:
         try:
             os.close(receive)
+            if user is not None:
+                os.setgroups([])
+                os.setgid(user[1])
+                os.setuid(user[0])
             confine(read, write, report=send)
         finally:
             os._exit(0)
@@ -256,3 +282,118 @@ def applied(read=(), write=()):
     finally:
         os.waitpid(pid, 0)
     return [part for part in told.split(',') if part]
+
+
+# ------------------------------------------------- what a host lacks, and why
+
+LAYERS = ('limits', 'namespaces', 'landlock')
+SYSCTL_FILE = '/etc/sysctl.d/90-confluent-sandbox.conf'
+APPARMOR_PROFILE = '/etc/apparmor.d/confluent'
+APPARMOR_SOURCES = ('/opt/confluent/share/apparmor/confluent',
+                    os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))),
+                                 'apparmor', 'confluent'))
+SETUP_HINT = 'confluent-netns sandbox --enable'
+
+
+def _setting(path):
+    try:
+        with open(path) as setting:
+            return setting.read().strip()
+    except OSError:
+        return None
+
+
+def diagnose(found):
+    """Why a layer of the confinement is missing on this host, and what
+    would provide it: a list of {'layer', 'reason', 'fix'} (and 'sysctl',
+    the settings that would, or 'apparmor': True, where a profile for the
+    service would), empty when found has them all."""
+    problems = []
+    if 'namespaces' not in found:
+        problem = {'layer': 'namespaces'}
+        if _setting('/proc/sys/user/max_user_namespaces') == '0':
+            problem.update(reason='user namespaces are turned off (user.max_user_namespaces = 0)',
+                           sysctl={'user.max_user_namespaces': '15000'}, fix=SETUP_HINT)
+        elif _setting('/proc/sys/kernel/unprivileged_userns_clone') == '0':
+            problem.update(
+                reason='unprivileged user namespaces are turned off '
+                       '(kernel.unprivileged_userns_clone = 0)',
+                sysctl={'kernel.unprivileged_userns_clone': '1'}, fix=SETUP_HINT)
+        elif _setting('/proc/sys/kernel/apparmor_restrict_unprivileged_userns') == '1':
+            problem.update(
+                reason='AppArmor restricts user namespaces to programs with a profile '
+                       'that allows them',
+                apparmor=True, fix=SETUP_HINT + ', then restart confluent')
+        else:
+            problem.update(reason='namespaces could not be created (in a container, '
+                                  'or refused by a security policy of the host)',
+                           fix='allow the service user to create user namespaces')
+        problems.append(problem)
+    if 'landlock' not in found:
+        problem = {'layer': 'landlock'}
+        active = _setting('/sys/kernel/security/lsm')
+        if landlock_abi():
+            problem.update(reason='Landlock is available but could not be applied',
+                           fix='see the trace log of the service')
+        elif active is not None and 'landlock' not in active.split(','):
+            problem.update(
+                reason='Landlock is not among the active security modules ({0})'.format(active),
+                fix='boot with lsm={0},landlock on the kernel command line (Linux 5.13 '
+                    'or later, built with Landlock)'.format(active))
+        else:
+            problem.update(reason='the kernel does not provide Landlock',
+                           fix='needs Linux 5.13 or later, built with Landlock')
+        problems.append(problem)
+    return problems
+
+
+def required():
+    """Whether a tenant's media is only handled fully confined
+    ([tenants] media_sandbox = required in service.cfg)."""
+    try:
+        import confluent.config.conf as conf
+        return (conf.get_option('tenants', 'media_sandbox') or '').strip().lower() == 'required'
+    except Exception:
+        return False
+
+
+def missing():
+    """The layers this host does not provide to the workers."""
+    return [layer for layer in LAYERS if layer not in supported()]
+
+
+def enable(problems, run=None, out=None):
+    """Provide what diagnose() found missing, as far as settings of the
+    host can (run as root, on the operator's request): returns the lines
+    telling what was done and what is left to do."""
+    import shutil
+    import subprocess
+    run = run or subprocess.call
+    told = []
+    settings = {}
+    for problem in problems:
+        settings.update(problem.get('sysctl', {}))
+    if settings:
+        with open(SYSCTL_FILE, 'w') as conffile:
+            conffile.write('# Written by "confluent-netns sandbox --enable": lets the confluent\n'
+                           '# service confine the programs that read the media of tenants.\n')
+            for name in sorted(settings):
+                conffile.write('{0} = {1}\n'.format(name, settings[name]))
+        run(['sysctl', '-q', '-p', SYSCTL_FILE])
+        told.append('wrote {0} ({1})'.format(SYSCTL_FILE, ', '.join(
+            '{0} = {1}'.format(name, settings[name]) for name in sorted(settings))))
+    if any(problem.get('apparmor') for problem in problems):
+        source = [path for path in APPARMOR_SOURCES if os.path.exists(path)]
+        if not source:
+            told.append('the AppArmor profile of the service is not installed')
+        else:
+            shutil.copyfile(source[0], APPARMOR_PROFILE)
+            if run(['apparmor_parser', '-r', APPARMOR_PROFILE]) == 0:
+                told.append('installed and loaded {0}; restart confluent for it to '
+                            'apply'.format(APPARMOR_PROFILE))
+            else:
+                told.append('installed {0}, which AppArmor did not load'.format(APPARMOR_PROFILE))
+    for problem in problems:
+        if not problem.get('sysctl') and not problem.get('apparmor'):
+            told.append('{0}: {1}; {2}'.format(problem['layer'], problem['reason'], problem['fix']))
+    return told

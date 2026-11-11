@@ -311,6 +311,35 @@ def status(tenantid):
     }
 
 
+def service_user():
+    """(uid, gid) the service runs as, or None when that is root."""
+    try:
+        owner = os.stat('/etc/confluent')
+    except OSError:
+        return None
+    return (owner.st_uid, owner.st_gid) if owner.st_uid else None
+
+
+def sandbox_command(enable=False, out=None):
+    """Tell (and with enable, provide) what the service user has to
+    confine the programs that read the media of tenants."""
+    import confluent.sandbox as sandbox
+    out = out or sys.stdout
+    found = sandbox.applied(user=service_user())
+    problems = sandbox.diagnose(found)
+    out.write('in effect: {0}\n'.format(', '.join(found)))
+    for problem in problems:
+        out.write('missing: {0}: {1}\n         {2}\n'.format(
+            problem['layer'], problem['reason'], problem['fix']))
+    if enable and problems:
+        for line in sandbox.enable(problems):
+            out.write(line + '\n')
+        found = sandbox.applied(user=service_user())
+        out.write('in effect now: {0}\n'.format(', '.join(found)))
+        problems = sandbox.diagnose(found)
+    return 0 if not problems else 2
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         prog='confluent-netns',
@@ -329,6 +358,11 @@ def main(argv=None):
     det = sub.add_parser('detach')
     det.add_argument('tenant')
     det.add_argument('name', help='device, or device.vlan')
+    box = sub.add_parser(
+        'sandbox', help='tell how the programs reading the media of tenants are '
+                        'confined on this host')
+    box.add_argument('--enable', action='store_true',
+                     help='change the settings of the host that keep them from being confined')
     args = parser.parse_args(argv)
     if not args.command:
         parser.print_help()
@@ -336,6 +370,8 @@ def main(argv=None):
     if os.geteuid() != 0:
         sys.stderr.write('confluent-netns must run as root\n')
         return 1
+    if args.command == 'sandbox':
+        return sandbox_command(args.enable)
     try:
         if args.command == 'setup':
             setup(args.tenant)

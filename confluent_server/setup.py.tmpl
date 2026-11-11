@@ -42,6 +42,7 @@ setup(
              'bin/confluent-netcfg'],
     data_files=[('/usr/lib/sysctl.d', ['sysctl/confluent.conf']),
                 ('/opt/confluent/share/licenses/confluent_server', ['LICENSE', 'COPYRIGHT']),
+                ('/opt/confluent/share/apparmor', ['apparmor/confluent']),
                 ('/usr/lib/systemd/system', ['systemd/confluent.service',
                                              'systemd/confluent-netns@.service',
                                              'systemd/confluent-nsbroker@.service',
