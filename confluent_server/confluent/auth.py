@@ -161,6 +161,10 @@ _tenant_paths = [re.compile(p) for p in (
     # Decoding an alert (SNMP trap contents) of one of its own nodes.
     r'^/events(/decode)?/?$',
     r'^/(nodes|noderange)/[^/]+/events/hardware/decode$',
+    # Consoles of, and shell sessions on, its own nodes (connected through
+    # its network, logged in its own log tree).
+    r'^/nodes/[^/]+/console/session(/.*)?$',
+    r'^/nodes/[^/]+/shell/sessions(/.*)?$',
 )]
 
 

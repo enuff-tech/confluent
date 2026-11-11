@@ -78,6 +78,9 @@ def _reset_module_state():
     # get_myname() reads, and if missing writes, /etc/confluent/cfg/myname
     # regardless of the configuration directory: give it a name instead.
     configmanager.mycachedname[:] = ['testhost', float('inf')]
+    collective = sys.modules.get('confluent.collective.manager')
+    if collective is not None:  # it keeps a copy of its own
+        collective.mycachedname[:] = ['testhost', float('inf')]
     configmanager.statelessmode = False
     auth._passcache.clear()
     auth._passchecking.clear()

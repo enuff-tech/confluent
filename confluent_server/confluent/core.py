@@ -926,11 +926,18 @@ class BadPlugin(object):
 # Plugins that act on a tenant's hardware through the tenant's own network.
 # Others would act from the host's network and are refused for tenants.
 TENANT_PLUGINS = frozenset([
-    'ipmi', 'redfish', 'null',
+    'ipmi', 'redfish', 'null', 'openbmc', 'tsmsol',
     'affluent', 'cnos', 'cooltera', 'deltapdu', 'eatonpdu', 'enlogic', 'enos',
     'geist', 'nxos', 'proxmox', 'raritan', 'srlinux', 'vcenter'])
-# Fixed handlers a tenant may reach (configuration only).
-TENANT_HANDLERS = frozenset(['attributes'])
+# Fixed handlers a tenant may reach: configuration, and shell sessions on
+# its nodes (ssh through the tenant's network).
+TENANT_HANDLERS = frozenset(['attributes', 'ssh', 'shellserver'])
+
+
+def _handler_name(handler):
+    if isinstance(handler, str):
+        return handler
+    return getattr(handler, '__name__', '').rsplit('.', 1)[-1]
 
 
 class TenantUnsupportedPlugin(object):
@@ -1166,7 +1173,8 @@ async def handle_node_request(configmanager, inputdata, operation,
     _plugin = None
 
     if 'handler' in plugroute:  # fixed handler definition, easy enough
-        if configmanager.tenant is not None and plugroute['handler'] not in TENANT_HANDLERS:
+        if (configmanager.tenant is not None
+                and _handler_name(plugroute['handler']) not in TENANT_HANDLERS):
             raise exc.ForbiddenRequest('Not yet available within a tenant')
         if isinstance(plugroute['handler'], str):
             hfunc = getattr(pluginmap[plugroute['handler']], operation)

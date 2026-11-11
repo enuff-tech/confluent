@@ -41,6 +41,8 @@ ELEMENTS = ('power/state', 'health/hardware', 'inventory/hardware/all/all',
 # Covered with real BMCs by test_tenant_hardware.py, and slow to time out
 # without one.
 SKIP = frozenset(['ipmi', 'null'])
+# Console plugins have no hardware elements: they are swept by connecting.
+CONSOLE = frozenset(['openbmc', 'tsmsol'])
 
 
 def _hardware_plugins():
@@ -116,5 +118,45 @@ async def test_tenant_plugins_never_use_the_host_network(sweep):
     assert topology.decoy_hits() == hits
     assert not set(allowed) & set(unsafe), 'unsafe plugins allowed for tenants: {0}'.format(
         sorted(set(allowed) & set(unsafe)))
-    assert set(allowed) - SKIP - set(['null']) <= set(plugins)  # all were exercised
+    assert set(allowed) - SKIP - CONSOLE - set(['null']) <= set(plugins)  # all were exercised
     assert outcome  # the sweep did run plugins
+
+
+async def test_tenant_console_plugins_never_use_the_host_network(sweep):
+    topology, plugins, cfm, allowed = sweep
+    assert CONSOLE <= set(allowed) and CONSOLE <= set(core.pluginmap)
+    topology.start_https(A)  # something to talk to, in the tenant's network
+    hits = topology.decoy_hits()
+    await cfm.set_node_attributes(dict(
+        ('c-' + p, {'console.method': p, 'hardwaremanagement.manager': HW_IP,
+                    'secret.hardwaremanagementuser': 'admin',
+                    'secret.hardwaremanagementpassword': 'secret'})
+        for p in CONSOLE), autocreate=True)
+    outcome = {}
+
+    async def output(data):
+        pass
+    for plugin in sorted(CONSOLE):
+        tenantguard.recent_violations.clear()
+        tenantnet.enter(A)
+        try:
+            consoles = await core.handle_path(
+                '/nodes/c-{0}/_console/session'.format(plugin), 'create', cfm)
+            async for console in consoles:
+                try:
+                    await asyncio.wait_for(console.connect(output), 20)
+                    outcome[plugin] = 'connected'
+                except tenantguard.TenantNetworkViolation:
+                    outcome[plugin] = 'violation'
+                except Exception as e:
+                    # the fake endpoint is no BMC: what matters is where
+                    # the attempt went
+                    outcome[plugin] = type(e).__name__
+                finally:
+                    await console.close()
+        finally:
+            tenantnet.enter(None)
+        assert list(tenantguard.recent_violations) == [], plugin
+    print('console plugin outcomes:', outcome)
+    assert set(outcome) == set(CONSOLE)
+    assert topology.decoy_hits() == hits
