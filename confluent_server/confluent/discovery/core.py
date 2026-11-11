@@ -2032,7 +2032,7 @@ async def _tenant_detection(tenant, state):
             # the host administrator
             if not reported:
                 reported = True
-                log.log({'info': 'Discovery is not listening for tenant {0} '
+                log.service_log({'info': 'Discovery is not listening for tenant {0} '
                                  'until its network is available: {1}'.format(tenant, e)})
             await asyncio.sleep(TENANT_LISTENER_RETRY)
     cfg = cfm.ConfigManager(tenant)
@@ -2049,7 +2049,7 @@ async def _tenant_detection(tenant, state):
     state['listening'] = True
     # and, now that answers will be heard, search the networks once
     _tenant_scan['scanner'] = tasks.spawn_task(_tenant_scan_networks())
-    log.log({'info': 'Discovery is listening in the networks of tenant {0}'.format(tenant)})
+    log.service_log({'info': 'Discovery is listening in the networks of tenant {0}'.format(tenant)})
 
 
 async def _tenant_listener(tenant, listener):
@@ -2058,7 +2058,7 @@ async def _tenant_listener(tenant, listener):
     except asyncio.CancelledError:
         raise
     except Exception:
-        log.log({'error': 'A discovery listener of tenant {0} failed, check '
+        log.service_log({'error': 'A discovery listener of tenant {0} failed, check '
                           'the trace log'.format(tenant)})
         log.logtrace()
 

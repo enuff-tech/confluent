@@ -309,9 +309,9 @@ class TLSCertVerifier(object):
                                          self.fieldname, 'newkey')
             if newpolicy in ('', 'tofu'):
                 fingerprint = get_fingerprint(certificate, 'sha256')
-                auditlog = log.Logger('audit')
+                auditlog = log.AuditLog()
                 auditlog.log({'node': self.node, 'event': 'certautoadd',
-                            'fingerprint': fingerprint})
+                            'fingerprint': fingerprint}, tenant=self.cfm.tenant)
                 tasks.spawn(self.cfm.set_node_attributes(
                     {self.node: {self.fieldname: fingerprint}}))
                 return True
@@ -322,9 +322,9 @@ class TLSCertVerifier(object):
         if self.subject:
             try:
                 if verification and self.verify_by_ca(certificate):
-                    auditlog = log.Logger('audit')
+                    auditlog = log.AuditLog()
                     auditlog.log({'node': self.node, 'event': 'certautoupdate',
-                                  'fingerprint': fingerprint})
+                                  'fingerprint': fingerprint}, tenant=self.cfm.tenant)
                     tasks.spawn(self.cfm.set_node_attributes(
                         {self.node: {self.fieldname: fingerprint}}))
                     return True

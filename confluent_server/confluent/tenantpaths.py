@@ -21,12 +21,15 @@ as before. Every other tenant has trees of its own:
     /var/lib/confluent/tenants/<tenant id>/private   (to authenticated nodes)
 
 laid out like the default ones (os/<profile>/..., site/...). A tenant's
-nodes are only ever served from its own trees.
+nodes are only ever served from its own trees. They are deleted, like the
+tenant's logs, when the tenant is.
 """
 
+import asyncio
 import os
 
 import confluent.config.configmanager as configmanager
+import confluent.log as log
 
 BASE = '/var/lib/confluent'
 
@@ -51,6 +54,28 @@ def public_path(tenant, *parts):
     """A path below the tenant's public tree (as the default tenant's code
     spells /var/lib/confluent/public/...)."""
     return os.path.join(public_root(tenant), *parts)
+
+
+def remove_tenant(tenant):
+    """Delete a tenant's deployment trees (and nothing else: the path is
+    derived from the validated id and removed without following links)."""
+    configmanager._remove_tenant_directory(BASE, tenant)
+
+
+def _tenant_state_changed(tenant, state):
+    if state != 'deleted':
+        return
+    # what was kept for the tenant on disk goes with it: its logs, and
+    # its deployment content
+    log.remove_tenant(tenant)
+    try:
+        # images are large: off the event loop
+        asyncio.get_running_loop().run_in_executor(None, remove_tenant, tenant)
+    except RuntimeError:
+        remove_tenant(tenant)
+
+
+configmanager.watch_tenant_state(_tenant_state_changed)
 
 
 def contained_file(root, relative):

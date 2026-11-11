@@ -90,6 +90,17 @@ def _reset_module_state():
     if services is not None:
         for tenant in list(services._services):
             services.stop(tenant)
+    logs = sys.modules.get('confluent.log')
+    if logs is not None:
+        # loggers remember the log directory they were opened in
+        for logger in list(logs._tenantlogs.values()) + [logs.globaleventlog]:
+            if logger is not None:
+                try:
+                    logger.handler.close()
+                except Exception:
+                    pass
+        logs._tenantlogs.clear()
+        logs.globaleventlog = None
     tenantstate = sys.modules.get('confluent.tenantstate')
     if tenantstate is not None:
         # per-tenant module state (discovery, PXE) of the previous test

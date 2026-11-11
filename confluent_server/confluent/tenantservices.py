@@ -272,7 +272,7 @@ async def _serve(tenant, state):
         except tenantnet.TenantNetworkError as e:
             if not reported:
                 reported = True
-                log.log({'info': 'Nodes of tenant {0} are not served until its '
+                log.service_log({'info': 'Nodes of tenant {0} are not served until its '
                                  'network is available: {1}'.format(tenant, e)})
             await asyncio.sleep(RETRY)
     names = set()
@@ -302,9 +302,9 @@ async def _serve(tenant, state):
         except tenantnet.BrokerError as e:
             if family == 'inet':
                 raise
-            log.log({'info': 'Tenant {0} is not served over IPv6: {1}'.format(tenant, e)})
+            log.service_log({'info': 'Tenant {0} is not served over IPv6: {1}'.format(tenant, e)})
     state['serving'] = True
-    log.log({'info': 'Serving the nodes of tenant {0} in its network '
+    log.service_log({'info': 'Serving the nodes of tenant {0} in its network '
                      '({1})'.format(tenant, ', '.join(sorted(names)))})
 
 
