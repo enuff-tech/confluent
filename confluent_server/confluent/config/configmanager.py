@@ -84,6 +84,7 @@ import msgpack
 import operator
 import random
 import re
+import shutil
 import string
 import struct
 import threading
@@ -104,6 +105,19 @@ _rpclock = None
 _initlock = None
 _followerlocks = {}
 _config_areas = ('nodegroups', 'nodes', 'usergroups', 'users')
+# A tenant store additionally holds its registry record ('meta') and its own
+# tenant-scoped globals ('globals'), each persisted under tenants/<id>/.
+_tenant_config_areas = _config_areas + ('meta', 'globals')
+# Tenant ids are immutable and used for store keys, paths and replication;
+# names are for people and must be unique among existing tenants.
+_tenant_id_re = re.compile(r'^t[0-9a-f]{12}$')
+_tenant_name_re = re.compile(r'^[a-z0-9][a-z0-9-]{0,62}$')
+# Any store key that may become a directory under tenants/ (ids, and keys of
+# stores created before tenant ids existed). Anything else is never written.
+_tenant_dir_re = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$')
+_tenant_states = ('active', 'disabled')
+TENANCY_SCHEMA = 1
+_tenantkeys = {}  # tenant id -> (wrapped data key, unwrapped data key)
 tracelog = None
 # How to stop the service when a client asks for a shutdown. The running
 # service registers this, since only it knows how to unwind itself.
@@ -652,6 +666,394 @@ def is_tenant(tenant):
         return False
 
 
+# ---------------------------------------------------------------- tenants
+#
+# A tenant is an isolated configuration store, _cfgstore['tenant'][<id>],
+# persisted under <cfgdir>/tenants/<id>/. Its registry record lives in the
+# store itself (area 'meta'), so creating, changing and deleting a tenant
+# replicates and persists exactly like any other configuration change.
+# The default tenant (id None) is the main store and is not registered.
+
+def multitenancy_enabled():
+    return bool(get_global('multitenancy.enabled'))
+
+
+def valid_tenant_id(tenantid):
+    return isinstance(tenantid, str) and bool(_tenant_id_re.match(tenantid))
+
+
+def _validate_tenant_name(name):
+    name = confluent.util.stringify(name)
+    if not isinstance(name, str) or not _tenant_name_re.match(name):
+        raise exc.InvalidArgumentException(
+            'Tenant names must be 1-63 characters of lowercase letters, '
+            'digits and hyphens, starting with a letter or digit')
+    return name
+
+
+def _new_tenant_id():
+    while True:
+        tenantid = 't' + hexlify(os.urandom(6)).decode('ascii')
+        if not is_tenant(tenantid):
+            return tenantid
+
+
+def list_tenants():
+    """Ids of all registered tenants."""
+    if _cfgstore is None:
+        init()
+    return sorted(tid for tid, store in _cfgstore.get('tenant', {}).items()
+                  if 'name' in store.get('meta', {}))
+
+
+def get_tenant(tenantid):
+    """The registry record of a tenant, or None."""
+    if _cfgstore is None:
+        init()
+    meta = _cfgstore.get('tenant', {}).get(tenantid, {}).get('meta', {})
+    if 'name' not in meta:
+        return None
+    record = copy.deepcopy(meta)
+    record['id'] = tenantid
+    return record
+
+
+def find_tenant(name):
+    """The id of the tenant with this name, or None."""
+    name = confluent.util.stringify(name)
+    for tenantid in list_tenants():
+        if _cfgstore['tenant'][tenantid]['meta']['name'] == name:
+            return tenantid
+    return None
+
+
+def _wrap_tenant_key(key):
+    """Encrypt a tenant data key with the master key for storage."""
+    return '!'.join(confluent.util.stringify(base64.b64encode(x))
+                    for x in crypt_value(key))
+
+
+def _unwrap_tenant_key(tenantid, wrapped):
+    cached = _tenantkeys.get(tenantid)
+    if cached is not None and cached[0] == wrapped:
+        return cached[1]
+    key = decrypt_value(tuple(base64.b64decode(x) for x in wrapped.split('!')))
+    _tenantkeys[tenantid] = (wrapped, key)
+    return key
+
+
+async def create_tenant(name):
+    """Register a new tenant and return its id.
+
+    The id and the tenant's data key are generated here, once, and carried
+    in the replicated call so every collective member stores the same ones.
+    """
+    if not multitenancy_enabled():
+        raise exc.InvalidArgumentException('Multi-tenancy is not enabled')
+    name = _validate_tenant_name(name)
+    if find_tenant(name):
+        raise exc.InvalidArgumentException(
+            'Tenant name "{0}" is already in use'.format(name))
+    tenantid = _new_tenant_id()
+    await _create_tenant_record(tenantid, name, _wrap_tenant_key(os.urandom(32)),
+                                int(time.time()))
+    return tenantid
+
+
+async def _create_tenant_record(tenantid, name, wrappedkey, created):
+    if cfgleader:
+        return await exec_on_leader('_rpc_master_create_tenant', tenantid, name,
+                                    wrappedkey, created)
+    _check_new_tenant(tenantid, name)
+    if cfgstreams:
+        await exec_on_followers('_rpc_create_tenant', tenantid, name,
+                                wrappedkey, created)
+    _true_create_tenant(tenantid, name, wrappedkey, created)
+
+
+async def _rpc_master_create_tenant(tenantid, name, wrappedkey, created):
+    await _create_tenant_record(tenantid, name, wrappedkey, created)
+
+
+def _rpc_create_tenant(tenantid, name, wrappedkey, created):
+    _true_create_tenant(tenantid, name, wrappedkey, created)
+
+
+def _check_new_tenant(tenantid, name):
+    if not valid_tenant_id(tenantid):
+        raise exc.InvalidArgumentException('Invalid tenant id')
+    if is_tenant(tenantid):
+        raise exc.InvalidArgumentException('Tenant id already exists')
+    if find_tenant(name):
+        raise exc.InvalidArgumentException(
+            'Tenant name "{0}" is already in use'.format(name))
+
+
+def _true_create_tenant(tenantid, name, wrappedkey, created):
+    _check_new_tenant(tenantid, name)
+    store = {
+        'meta': {'name': name, 'state': 'active', 'created': created,
+                 'schema': TENANCY_SCHEMA},
+        'globals': {'data_key': wrappedkey, 'max_node_index': 1,
+                    'free_node_indexes': []},
+        'nodegroups': {'everything': {'nodes': set()}},
+        'nodes': {},
+    }
+    _cfgstore.setdefault('tenant', {})[tenantid] = store
+    for area in ('meta', 'globals', 'nodegroups'):
+        for key in store[area]:
+            _mark_dirtykey(area, key, tenantid)
+    ConfigManager._bg_sync_to_file()
+
+
+async def set_tenant_state(tenantid, state):
+    if state not in _tenant_states:
+        raise exc.InvalidArgumentException(
+            'Tenant state must be one of: ' + ', '.join(_tenant_states))
+    if get_tenant(tenantid) is None:
+        raise exc.NotFoundException('No such tenant')
+    if cfgleader:
+        return await exec_on_leader('_rpc_master_set_tenant_state', tenantid, state)
+    if cfgstreams:
+        await exec_on_followers('_rpc_set_tenant_state', tenantid, state)
+    _true_set_tenant_state(tenantid, state)
+
+
+async def _rpc_master_set_tenant_state(tenantid, state):
+    await set_tenant_state(tenantid, state)
+
+
+def _rpc_set_tenant_state(tenantid, state):
+    _true_set_tenant_state(tenantid, state)
+
+
+def _true_set_tenant_state(tenantid, state):
+    _cfgstore['tenant'][tenantid]['meta']['state'] = state
+    _mark_dirtykey('meta', 'state', tenantid)
+    ConfigManager._bg_sync_to_file()
+
+
+async def delete_tenant(tenantid):
+    """Remove a tenant and all of its configuration.
+
+    Only a disabled tenant can be deleted, so a tenant in use is never
+    removed by accident.
+    """
+    record = get_tenant(tenantid)
+    if record is None:
+        raise exc.NotFoundException('No such tenant')
+    if record['state'] != 'disabled':
+        raise exc.InvalidArgumentException(
+            'A tenant must be disabled before it can be deleted')
+    if cfgleader:
+        return await exec_on_leader('_rpc_master_delete_tenant', tenantid)
+    if cfgstreams:
+        await exec_on_followers('_rpc_delete_tenant', tenantid)
+    _true_delete_tenant(tenantid)
+
+
+async def _rpc_master_delete_tenant(tenantid):
+    await delete_tenant(tenantid)
+
+
+def _rpc_delete_tenant(tenantid):
+    _true_delete_tenant(tenantid)
+
+
+def _true_delete_tenant(tenantid):
+    if not valid_tenant_id(tenantid) or not is_tenant(tenantid):
+        return
+    with _dirtylock:
+        # Drop unwritten changes for the tenant; the writer removes its
+        # directory instead (see _sync_to_file).
+        _cfgstore.get('dirtykeys', {}).pop(tenantid, None)
+        _cfgstore.setdefault('deletedtenants', set()).add(tenantid)
+        del _cfgstore['tenant'][tenantid]
+    idmap = _cfgstore.get('main', {}).get('idmap', {})
+    for uid in [u for u in idmap if idmap[u].get('tenant') == tenantid]:
+        del idmap[uid]
+        _mark_dirtykey('idmap', uid)
+    _tenantkeys.pop(tenantid, None)
+    for watchers in (ConfigManager._attribwatchers, ConfigManager._nodecollwatchers):
+        watchers.pop(tenantid, None)
+    ConfigManager._bg_sync_to_file()
+
+
+def _remove_tenant_directory(cfgdir, tenantid):
+    """Delete <cfgdir>/tenants/<id> and nothing else.
+
+    Also used for store keys from before tenant ids existed, which migration
+    moves to an id, so any safe single path component is accepted.
+    """
+    if not isinstance(tenantid, str) or not _tenant_dir_re.match(tenantid):
+        return
+    root = os.path.realpath(os.path.join(cfgdir, 'tenants'))
+    target = os.path.join(root, tenantid)
+    if os.path.islink(target) or not os.path.isdir(target):
+        return
+    if os.path.dirname(os.path.realpath(target)) != root:
+        return
+    shutil.rmtree(target)
+
+
+def _init_store_indexes(nodes, getglobal, setglobal, tenant):
+    """Assign id.index to nodes that lack one and seed the counters.
+
+    Each store, the main one and every tenant, numbers its nodes on its own,
+    so identically named nodes in two tenants can have the same index.
+    """
+    if getglobal('max_node_index') is not None:
+        return False
+    maxidx = 1
+    missing = []
+    for node in confluent.util.natural_sort(nodes):
+        nidx = nodes[node].get('id.index', {}).get('value', None)
+        if nidx is None:
+            missing.append(node)
+        elif nidx >= maxidx:
+            maxidx = nidx + 1
+    for node in missing:
+        nodes[node]['id.index'] = {'value': maxidx}
+        maxidx += 1
+        _mark_dirtykey('nodes', node, tenant)
+    setglobal('max_node_index', maxidx)
+    setglobal('free_node_indexes', [])
+    return True
+
+
+def _tenant_record_for_dump(tenantid):
+    store = _cfgstore['tenant'][tenantid]
+    return {'meta': copy.deepcopy(store.get('meta', {})),
+            'globals': copy.deepcopy(store.get('globals', {}))}
+
+
+def _install_tenant_record(tenantid, record):
+    """Create or replace a tenant's registry record and globals from a dump.
+
+    The tenant's data key stays wrapped by the master key, so this is only
+    meaningful once the master key of the dump is in place.
+    """
+    if not valid_tenant_id(tenantid):
+        raise ValueError('Invalid tenant id "{0}"'.format(tenantid))
+    meta = record.get('meta', {})
+    if 'name' not in meta:
+        raise ValueError('Tenant {0} has no name'.format(tenantid))
+    _validate_tenant_name(meta['name'])
+    other = find_tenant(meta['name'])
+    if other is not None and other != tenantid:
+        raise ValueError('Tenant name "{0}" is already used by {1}'.format(
+            meta['name'], other))
+    store = _cfgstore.setdefault('tenant', {}).setdefault(tenantid, {})
+    for area in ('meta', 'globals'):
+        old = store.get(area, {})
+        store[area] = copy.deepcopy(record.get(area, {}))
+        for key in set(old) | set(store[area]):
+            _mark_dirtykey(area, key, tenantid)
+    _tenantkeys.pop(tenantid, None)
+
+
+async def dump_collective_payload():
+    """The configuration a joining collective member receives.
+
+    This is the main store exactly as before, plus every tenant under the
+    '_tenants' key. Members from before tenants were replicated ignore keys
+    they do not know, so mixed-version collectives keep working.
+    """
+    ConfigManager.wait_for_sync()
+    data = json.loads(await ConfigManager(None)._dump_to_json())
+    tenants = {}
+    for tenantid in list_tenants():
+        tenants[tenantid] = {
+            'record': _tenant_record_for_dump(tenantid),
+            'data': json.loads(await ConfigManager(tenantid)._dump_to_json())}
+    if tenants:
+        data['_tenants'] = tenants
+    return json.dumps(data, sort_keys=True).encode('utf8')
+
+
+async def load_collective_tenants(jsondata):
+    """Install the tenants of a dump_collective_payload() payload."""
+    data = json.loads(jsondata)
+    for tenantid in sorted(data.get('_tenants', {})):
+        entry = data['_tenants'][tenantid]
+        _install_tenant_record(tenantid, entry['record'])
+        await ConfigManager(tenantid)._load_from_json(json.dumps(entry['data']))
+
+
+async def migrate_tenancy():
+    """Bring the configuration store to the current tenancy schema.
+
+    The main store, which is the default tenant, is left exactly as it is.
+    Tenant stores without a registry record, which only internal callers
+    could create before tenants were registered, are registered: a store
+    whose key is not a tenant id is moved to a new id and keeps its key as
+    its name. Secrets of such stores, encrypted with the master key, are
+    re-encrypted with a new per-tenant data key.
+
+    Safe to run repeatedly: returns a list of what it changed, which is
+    empty once the store is current.
+    """
+    changes = []
+    unregistered = [k for k in sorted(_cfgstore.get('tenant', {}))
+                    if 'name' not in _cfgstore['tenant'][k].get('meta', {})]
+    if unregistered and len(list(list_collective())) > 1:
+        # Ids and keys are generated here; doing that independently on each
+        # member would leave the collective disagreeing.
+        raise exc.InvalidArgumentException(
+            'Unregistered tenant stores ({0}) can only be migrated on a '
+            'standalone server'.format(', '.join(unregistered)))
+    for key in unregistered:
+        store = _cfgstore['tenant'][key]
+        name = key.lower() if _tenant_name_re.match(key.lower()) else None
+        if name is None or find_tenant(name):
+            name = 'tenant-' + hexlify(os.urandom(3)).decode('ascii')
+        tenantid = key if valid_tenant_id(key) else _new_tenant_id()
+        olddata = ConfigManager(key, decrypt=True)
+        secrets = _collect_store_secrets(olddata)
+        if tenantid != key:
+            with _dirtylock:
+                _cfgstore.get('dirtykeys', {}).pop(key, None)
+                _cfgstore.setdefault('deletedtenants', set()).add(key)
+                _cfgstore['tenant'][tenantid] = _cfgstore['tenant'].pop(key)
+            idmap = _cfgstore.get('main', {}).get('idmap', {})
+            for uid in idmap:
+                if idmap[uid].get('tenant') == key:
+                    idmap[uid]['tenant'] = tenantid
+                    _mark_dirtykey('idmap', uid)
+        store = _cfgstore['tenant'][tenantid]
+        store['meta'] = {'name': name, 'state': 'active',
+                         'created': int(time.time()), 'schema': TENANCY_SCHEMA}
+        store.setdefault('globals', {})['data_key'] = _wrap_tenant_key(os.urandom(32))
+        _restore_store_secrets(ConfigManager(tenantid), secrets)
+        for area in _tenant_config_areas:
+            for element in store.get(area, {}):
+                _mark_dirtykey(area, element, tenantid)
+        changes.append({'store': key, 'id': tenantid, 'name': name})
+    if get_global('tenancy.schema') != TENANCY_SCHEMA:
+        set_global('tenancy.schema', TENANCY_SCHEMA)
+        changes.append({'schema': TENANCY_SCHEMA})
+    ConfigManager.wait_for_sync(True)
+    return changes
+
+
+def _collect_store_secrets(cfm):
+    """Decrypted values of every encrypted attribute of a store."""
+    secrets = []
+    for area in ('nodes', 'nodegroups', 'users'):
+        for element, attrs in cfm._cfgstore.get(area, {}).items():
+            for attr, val in attrs.items():
+                if isinstance(val, dict) and 'cryptvalue' in val:
+                    secrets.append((area, element, attr, decrypt_value(
+                        val['cryptvalue'], key=cfm._cryptkey())))
+    return secrets
+
+
+def _restore_store_secrets(cfm, secrets):
+    for area, element, attr, value in secrets:
+        cfm._cfgstore[area][element][attr]['cryptvalue'] = crypt_value(
+            value, key=cfm._cryptkey())
+
+
 def get_global(globalname):
     """Get a global variable
 
@@ -946,12 +1348,17 @@ def commit_clear():
     _oldcfgstore = None
     _oldtxcount = 0
     with _synclock:
-        todelete = ('transactioncount', 'globals', 'collective') + _config_areas
+        todelete = ('transactioncount', 'globals', 'collective', 'idmap') + _config_areas
         for cfg in todelete:
             try:
                 os.remove(os.path.join(ConfigManager._cfgdir, cfg))
             except OSError:
                 pass
+        # Tenants come from the new configuration in full; anything left on
+        # disk from before would come back on the next restart.
+        tenantroot = os.path.join(ConfigManager._cfgdir, 'tenants')
+        if os.path.isdir(tenantroot) and not os.path.islink(tenantroot):
+            shutil.rmtree(tenantroot)
     ConfigManager.wait_for_sync(True)
     ConfigManager._bg_sync_to_file()
     _ready = True
@@ -1315,7 +1722,8 @@ class _ExpressionFormat(string.Formatter):
         return val
 
 
-def _decode_attribute(attribute, nodeobj, formatter=None, decrypt=False):
+def _decode_attribute(attribute, nodeobj, formatter=None, decrypt=False,
+                      cryptkey=None):
     if attribute not in nodeobj:
         return None
     # if we have an expression and a formatter, that overrides 'value'
@@ -1337,7 +1745,8 @@ def _decode_attribute(attribute, nodeobj, formatter=None, decrypt=False):
         return nodeobj[attribute]
     elif 'cryptvalue' in nodeobj[attribute] and decrypt:
         retdict = copy.deepcopy(nodeobj[attribute])
-        retdict['value'] = decrypt_value(nodeobj[attribute]['cryptvalue'])
+        retdict['value'] = decrypt_value(nodeobj[attribute]['cryptvalue'],
+                                         key=cryptkey)
         return retdict
     return nodeobj[attribute]
 
@@ -1438,18 +1847,67 @@ class ConfigManager(object):
             elif tenant and tenant not in _cfgstore.get('tenant', {}):
                 raise ValueError("Tenant {0} does not exist".format(tenant))
             self.tenant = tenant
+            changed = create_tenant
             if 'nodegroups' not in self._cfgstore:
                 self._cfgstore['nodegroups'] = {'everything': {'nodes': set()}}
                 _mark_dirtykey('nodegroups', 'everything', self.tenant)
+                changed = True
             elif 'nodes' not in self._cfgstore['nodegroups'].setdefault('everything', {}):
                 # Tenant stores created before 'everything' carried a node
                 # set; without one, adding any node raises KeyError.
                 self._cfgstore['nodegroups']['everything']['nodes'] = set()
                 _mark_dirtykey('nodegroups', 'everything', self.tenant)
+                changed = True
             if 'nodes' not in self._cfgstore:
                 self._cfgstore['nodes'] = {}
-            self._bg_sync_to_file()
-            self.wait_for_sync()
+            if _init_store_indexes(self._cfgstore['nodes'], self.get_scoped_global,
+                                   self._set_tenant_global, self.tenant):
+                changed = True
+            # Opening a tenant is done per request, so only write (and wait
+            # for the write) when opening it actually changed something.
+            if changed:
+                self._bg_sync_to_file()
+                self.wait_for_sync()
+
+    def get_scoped_global(self, globalname):
+        """A global of this configuration's tenant.
+
+        For the default tenant these are the service globals (get_global);
+        each other tenant has its own, so per-tenant settings and counters
+        never collide. Like set_global, changes are local to this collective
+        member unless made by replicated code.
+        """
+        if self.tenant is None:
+            return get_global(globalname)
+        return self._cfgstore.get('globals', {}).get(globalname)
+
+    def set_scoped_global(self, globalname, value):
+        if self.tenant is None:
+            set_global(globalname, value)
+            return
+        self._set_tenant_global(globalname, value)
+        self._bg_sync_to_file()
+
+    def _set_tenant_global(self, globalname, value):
+        if self.tenant is None:
+            set_global(globalname, value, sync=False)
+            return
+        globalname = confluent.util.stringify(globalname)
+        self._cfgstore.setdefault('globals', {})[globalname] = value
+        _mark_dirtykey('globals', globalname, self.tenant)
+
+    def _cryptkey(self):
+        """The key secrets of this tenant are encrypted with.
+
+        None means the master key: always for the default tenant, and for
+        tenant stores created before tenants had their own data key.
+        """
+        if self.tenant is None:
+            return None
+        wrapped = self._cfgstore.get('globals', {}).get('data_key')
+        if not wrapped:
+            return None
+        return _unwrap_tenant_key(self.tenant, wrapped)
 
     def add_client_file(self, clientfile):
         filename = os.path.normpath(clientfile.filename)
@@ -1660,7 +2118,7 @@ class ConfigManager(object):
             if decrypt:
                 for key in ret:
                     if isinstance(ret[key], dict) and 'cryptvalue' in ret[key]:
-                        ret[key]['value'] = decrypt_value(ret[key]['cryptvalue'])
+                        ret[key]['value'] = decrypt_value(ret[key]['cryptvalue'], key=self._cryptkey())
             return ret
 
         except KeyError:
@@ -1797,7 +2255,7 @@ class ConfigManager(object):
                     if attribute in user:
                         del user[attribute]
                     continue
-                user[attribute] = {'cryptvalue': crypt_value(attributemap[attribute])}
+                user[attribute] = {'cryptvalue': crypt_value(attributemap[attribute], key=self._cryptkey())}
             else:
                 user[attribute] = attributemap[attribute]
         _mark_dirtykey('users', name, self.tenant)
@@ -1905,7 +2363,8 @@ class ConfigManager(object):
             if attribute not in cfgnodeobj:
                 continue
             nodeobj[attribute] = _decode_attribute(attribute, cfgnodeobj,
-                                                   decrypt=self.decrypt)
+                                                   decrypt=self.decrypt,
+                                                   cryptkey=self._cryptkey() if self.decrypt else None)
         return nodeobj
 
     def expand_attrib_expression(self, nodelist, expression):
@@ -1939,14 +2398,16 @@ class ConfigManager(object):
                 if '*' in attribute:
                     for attr in fnmatch.filter(list(cfgnodeobj), attribute):
                         nodeobj[attr] = _decode_attribute(attr, cfgnodeobj,
-                                                          decrypt=decrypt)
+                                                          decrypt=decrypt,
+                                                          cryptkey=self._cryptkey() if decrypt else None)
                 if attribute not in cfgnodeobj:
                     continue
                 # since the formatter is not passed in, the calculator is
                 # skipped.  The decryption, however, we want to do only on
                 # demand
                 nodeobj[attribute] = _decode_attribute(attribute, cfgnodeobj,
-                                                       decrypt=decrypt)
+                                                       decrypt=decrypt,
+                                                       cryptkey=self._cryptkey() if decrypt else None)
             retdict[node] = nodeobj
         return retdict
 
@@ -2177,7 +2638,7 @@ class ConfigManager(object):
                     newdict['value'] = decrypt_value(newdict['cryptvalue'], keydata['cryptkey'], keydata['integritykey'])
                     del newdict['cryptvalue']
                 if 'value' in newdict and (attr.startswith('secret.') or attr.startswith('custom.nodesecret.')):
-                    newdict['cryptvalue'] = crypt_value(newdict['value'])
+                    newdict['cryptvalue'] = crypt_value(newdict['value'], key=self._cryptkey())
                     del newdict['value']
                 if 'value' in newdict and attr.startswith("crypted."):
                     newdict['hashvalue'] = hashcrypt_value(newdict['value'])
@@ -2346,8 +2807,8 @@ class ConfigManager(object):
                                           changeset=changeset)
                 nidx = self._cfgstore['nodes'][node].get('id.index', {}).get('value', None)
                 if nidx is not None:
-                    currmaxidx = get_global('max_node_index')
-                    freeindexes = get_global('free_node_indexes')
+                    currmaxidx = self.get_scoped_global('max_node_index')
+                    freeindexes = self.get_scoped_global('free_node_indexes')
                     if not freeindexes:
                         freeindexes = []
                     if nidx == currmaxidx - 1:
@@ -2355,7 +2816,7 @@ class ConfigManager(object):
                         while _is_free_index(freeindexes, currmaxidx - 1):
                             _remove_free_index(freeindexes, currmaxidx - 1)
                             currmaxidx = currmaxidx - 1
-                        set_global('max_node_index', currmaxidx)
+                        self.set_scoped_global('max_node_index', currmaxidx)
                     else:
                         lastindex = freeindexes[-1] if freeindexes else [-2, -2]
                         if not isinstance(lastindex, list):
@@ -2366,7 +2827,7 @@ class ConfigManager(object):
                                 freeindexes[-1] = lastindex
                         else:
                             freeindexes.append(nidx)
-                    set_global('free_node_indexes', freeindexes)
+                    self.set_scoped_global('free_node_indexes', freeindexes)
                 del self._cfgstore['nodes'][node]
                 _mark_dirtykey('nodes', node, self.tenant)
         self._notif_attribwatchers(changeset)
@@ -2653,7 +3114,7 @@ class ConfigManager(object):
             exprmgr = None
             if node not in self._cfgstore['nodes']:
                 newnodes.append(node)
-                freeindexes = get_global('free_node_indexes')
+                freeindexes = self.get_scoped_global('free_node_indexes')
                 if not freeindexes:
                     freeindexes = []
                 if _count_freeindexes(freeindexes) > 128:  # tend to leave freed indexes disused until a lot have accumulated
@@ -2664,12 +3125,12 @@ class ConfigManager(object):
                             freeindexes[0] = freeindexes[0][0]
                     else:
                         nidx = freeindexes.pop(0)
-                    set_global('free_node_indexes', freeindexes)
+                    self.set_scoped_global('free_node_indexes', freeindexes)
                 else:
-                    nidx = get_global('max_node_index')
+                    nidx = self.get_scoped_global('max_node_index')
                     if nidx is None:
                         nidx = 1
-                    set_global('max_node_index', nidx + 1)
+                    self.set_scoped_global('max_node_index', nidx + 1)
                 self._cfgstore['nodes'][node] = {'id.index': {'value': nidx}}
                 if merge == "skip":
                     # the index just allocated is known to be free, while an
@@ -2692,7 +3153,7 @@ class ConfigManager(object):
                     newdict['value'] = decrypt_value(newdict['cryptvalue'], keydata['cryptkey'], keydata['integritykey'])
                     del newdict['cryptvalue']
                 if 'value' in newdict and (attrname.startswith('secret.') or attrname.startswith('custom.nodesecret.')):
-                    newdict['cryptvalue'] = crypt_value(newdict['value'])
+                    newdict['cryptvalue'] = crypt_value(newdict['value'], key=self._cryptkey())
                     del newdict['value']
                 if 'value' in newdict and attrname.startswith("crypted."):
                     newdict['hashvalue'] = hashcrypt_value(newdict['value'])
@@ -2788,17 +3249,38 @@ class ConfigManager(object):
                 tmpconfig[confarea][element] = newelement
         # We made it through above section without an exception, go ahead and
         # replace
-        # Start by erasing the dbm files if present
+        # Start by erasing the dbm files of this store (and only this store:
+        # a tenant restore must not touch the main store) if present
+        if self.tenant is None:
+            storedir = self._cfgdir
+        else:
+            storedir = os.path.join(self._cfgdir, 'tenants', self.tenant)
         for confarea in _config_areas:
             try:
-                os.unlink(os.path.join(self._cfgdir, confarea))
+                os.unlink(os.path.join(storedir, confarea))
             except OSError as e:
                 if e.errno == 2:
                     pass
         # Now we have to iterate through each fixed up element, using the
         # set attribute to flesh out inheritence and expressions
-        if (not merge) or _cfgstore.get('main', {}).get('idmap', None) is None:
+        idmap = _cfgstore.setdefault('main', {}).get('idmap', None)
+        if idmap is None:
             _cfgstore['main']['idmap'] = {}
+        elif not merge:
+            # Forget the ids of the users this restore replaces; ids of
+            # users in other stores stay.
+            for uid in [u for u in idmap if idmap[u].get('tenant') == self.tenant]:
+                del idmap[uid]
+                _mark_dirtykey('idmap', uid)
+        if self.tenant is None and not merge:
+            # Rewrite the id map file from memory so entries of replaced
+            # users do not come back from disk on the next start.
+            try:
+                os.unlink(os.path.join(storedir, 'idmap'))
+            except OSError:
+                pass
+            for uid in _cfgstore['main']['idmap']:
+                _mark_dirtykey('idmap', uid)
         attribmerge = merge if merge else "replace"
         for confarea in _config_areas:
             if not merge or confarea not in self._cfgstore:
@@ -2848,13 +3330,22 @@ class ConfigManager(object):
                        complex and interesting ways for non-secret
                        data.
 
+        The dump is produced by a worker process reading the on-disk store of
+        this configuration's tenant from this configuration's directory.
         """
+        args = [sys.executable, __file__, '-r' if redact else '',
+                '--cfgdir', self._cfgdir]
+        if self.tenant is not None:
+            args += ['--tenant', self.tenant]
         with open(os.devnull, 'w+') as devnull:
             worker = await asyncio.create_subprocess_exec(
-                sys.executable, __file__, '-r' if redact else '',
+                *args,
                         stdin=devnull, stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE)
             stdout, stderr = await worker.communicate()
+        if worker.returncode != 0:
+            raise Exception('Configuration dump failed: {0}'.format(
+                confluent.util.stringify(stderr).strip()[-500:]))
         return stdout
 
     def _real_dump_to_json(self, redact=None):
@@ -2926,7 +3417,7 @@ class ConfigManager(object):
             if not os.path.isdir(tenantpath):
                 continue
             _cfgstore.setdefault('tenant', {}).setdefault(tenant, {})
-            for confarea in _config_areas:
+            for confarea in _tenant_config_areas:
                 _load_dict_from_dbm(['tenant', tenant, confarea],
                                     os.path.join(tenantpath, confarea))
 
@@ -3039,22 +3530,27 @@ class ConfigManager(object):
                     except OSError:
                         pass
             if fullsync:
-                pathname = cls._cfgdir
-                currdict = _cfgstore['main']
-                for category in currdict:
-                    _mkpath(pathname)
-                    try:
-                        dbf = dbm.open(os.path.join(pathname, category), 'c', 384)  # 0600
-                    except dbm.error:
-                        if not fullsync:
-                            raise
-                        os.remove(os.path.join(pathname, category))
-                        dbf = dbm.open(os.path.join(pathname, category), 'c', 384)  # 0600
-                    try:
-                        for ck in currdict[category]:
-                            dbf[ck] = cPickle.dumps(currdict[category][ck], protocol=cPickle.HIGHEST_PROTOCOL)
-                    finally:
-                        dbf.close()
+                stores = [(cls._cfgdir, _cfgstore.get('main', {}))]
+                for tenant in list(_cfgstore.get('tenant', {})):
+                    store = _cfgstore.get('tenant', {}).get(tenant)
+                    if store is not None and _tenant_dir_re.match(tenant):
+                        stores.append((os.path.join(cls._cfgdir, 'tenants', tenant),
+                                       store))
+                for pathname, currdict in stores:
+                    for category in currdict:
+                        _mkpath(pathname)
+                        try:
+                            dbf = dbm.open(os.path.join(pathname, category), 'c', 384)  # 0600
+                        except dbm.error:
+                            if not fullsync:
+                                raise
+                            os.remove(os.path.join(pathname, category))
+                            dbf = dbm.open(os.path.join(pathname, category), 'c', 384)  # 0600
+                        try:
+                            for ck in currdict[category]:
+                                dbf[ck] = cPickle.dumps(currdict[category][ck], protocol=cPickle.HIGHEST_PROTOCOL)
+                        finally:
+                            dbf.close()
             elif 'dirtykeys' in _cfgstore:
                 with _dirtylock:
                     currdirt = copy.deepcopy(_cfgstore['dirtykeys'])
@@ -3065,9 +3561,13 @@ class ConfigManager(object):
                         pathname = cls._cfgdir
                         currdict = _cfgstore['main']
                     else:
+                        currdict = _cfgstore.get('tenant', {}).get(tenant)
+                        if currdict is None or not _tenant_dir_re.match(tenant):
+                            # deleted since the change, or not a safe name
+                            continue
                         pathname = os.path.join(cls._cfgdir, 'tenants', tenant)
-                        currdict = _cfgstore['tenant'][tenant]
                     for category in dkdict:
+                        catdict = currdict.get(category, {})
                         _mkpath(pathname)
                         try:
                             dbf = dbm.open(os.path.join(pathname, category), 'c', 384)  # 0600
@@ -3078,13 +3578,18 @@ class ConfigManager(object):
                             dbf = dbm.open(os.path.join(pathname, category), 'c', 384)  # 0600
                         try:
                             for ck in dkdict[category]:
-                                if ck not in currdict[category]:
+                                if ck not in catdict:
                                     if ck in dbf:
                                         del dbf[ck]
                                 else:
-                                    dbf[ck] = cPickle.dumps(currdict[category][ck], protocol=cPickle.HIGHEST_PROTOCOL)
+                                    dbf[ck] = cPickle.dumps(catdict[ck], protocol=cPickle.HIGHEST_PROTOCOL)
                         finally:
                             dbf.close()
+            with _dirtylock:
+                deleted = _cfgstore.pop('deletedtenants', set())
+            for tenant in deleted:
+                if tenant not in _cfgstore.get('tenant', {}):
+                    _remove_tenant_directory(cls._cfgdir, tenant)
         willrun = False
         with cls._syncstate:
             if cls._writepending:
@@ -3346,7 +3851,56 @@ async def restore_db_from_directory(location, password, merge=False,
             cfgdata, exclude, check_redacted=True)
         await ConfigManager(tenant=None)._load_from_json(
             cfgdata, merge=merge, keydata=kdd, skipped=skipped)
+    if not merge:
+        # Merging tenants into an existing configuration is not supported:
+        # their data keys are wrapped by the master key of the dump.
+        await _restore_tenants_from_directory(location, fmt, exclude, skipped)
     ConfigManager.wait_for_sync(True)
+
+
+def _read_dump_file(path, fmt):
+    with open(path, 'r') as dumpfile:
+        content = dumpfile.read()
+    if fmt == 'yaml':
+        content = yaml.load(content, _RestrictedYamlLoader)
+        if content is None:
+            raise ValueError(f"Invalid or empty YAML content in {path}")
+        return json.dumps(content)
+    return content
+
+
+async def _restore_tenants_from_directory(location, fmt, exclude, skipped):
+    tenantroot = os.path.join(location, 'tenants')
+    try:
+        tenants = sorted(os.listdir(tenantroot))
+    except OSError:
+        tenants = []
+    # A restore replaces the whole configuration: tenants on disk that are
+    # not in the dump are removed when the store is next written.
+    try:
+        ondisk = os.listdir(os.path.join(ConfigManager._cfgdir, 'tenants'))
+    except OSError:
+        ondisk = []
+    with _dirtylock:
+        for tenant in ondisk:
+            if valid_tenant_id(tenant) and tenant not in tenants:
+                _cfgstore.get('tenant', {}).pop(tenant, None)
+                _cfgstore.setdefault('deletedtenants', set()).add(tenant)
+    for tenant in tenants:
+        recordfile = os.path.join(tenantroot, tenant, f'tenant.{fmt}')
+        if not os.path.exists(recordfile):
+            # Dumps from before tenant records existed put a second copy of
+            # the main configuration here; it is not tenant data.
+            continue
+        record = json.loads(_read_dump_file(recordfile, fmt))
+        if 'data_key' not in record.get('globals', {}):
+            raise Exception('Cannot restore tenant {0} without its data key, '
+                            'this may be a redacted dump'.format(tenant))
+        cfgdata = _exclude_node_attributes(
+            _read_dump_file(os.path.join(tenantroot, tenant, f'main.{fmt}'), fmt),
+            exclude, check_redacted=True)
+        _install_tenant_record(tenant, record)
+        await ConfigManager(tenant)._load_from_json(cfgdata, skipped=skipped)
 
 async def dump_db_to_directory(location, password, redact=None, skipkeys=False,
                                fmt='json', exclude=None):
@@ -3373,6 +3927,14 @@ async def dump_db_to_directory(location, password, redact=None, skipkeys=False,
                 yaml.safe_dump(json.loads(jsondata), cfgfile,
                                default_flow_style=False)
 
+    # The dumps are produced from the on-disk store, so write it out first
+    ConfigManager.wait_for_sync()
+    unregistered = [t for t in _cfgstore.get('tenant', {}) if get_tenant(t) is None]
+    if unregistered:
+        raise Exception(
+            'Tenant stores without a registry record ({0}) cannot be backed '
+            'up; run "confluentdbutil migrate-tenancy" first'.format(
+                ', '.join(sorted(unregistered))))
     # Handle keys file
     if not redact and not skipkeys:
         writecfg('keys', _dump_keys(password))
@@ -3386,13 +3948,15 @@ async def dump_db_to_directory(location, password, redact=None, skipkeys=False,
     bkupglobals = get_globals()
     if bkupglobals:
         writecfg('globals', json.dumps(bkupglobals))
-    # Handle tenants
-    try:
-        tenants = os.listdir(os.path.join(ConfigManager._cfgdir, 'tenants'))
-    except OSError:
-        tenants = []
-    for tenant in tenants:
+    # Handle tenants: tenants/<id>/tenant holds the registry record and the
+    # tenant's globals (its data key stays wrapped by the master key),
+    # tenants/<id>/main its configuration in the same form as main.
+    for tenant in list_tenants():
         os.makedirs(os.path.join(location, 'tenants', tenant), exist_ok=True)
+        record = _tenant_record_for_dump(tenant)
+        if redact:
+            record['globals'].pop('data_key', None)
+        writecfg(os.path.join('tenants', tenant, 'tenant'), json.dumps(record))
         tenant_data = await ConfigManager(tenant=tenant)._dump_to_json(
             redact=redact)
         writecfg(os.path.join('tenants', tenant, 'main'),
@@ -3449,10 +4013,22 @@ def init(stateless=False, cfgdir=None):
 
 
 if __name__ == '__main__':
+    # Dump worker for ConfigManager._dump_to_json: read the store from disk
+    # and print it. It never writes, so it cannot race the running service.
     redact=None
     if '-r' in sys.argv:
         redact=True
-    sys.stdout.write(ConfigManager(None)._real_dump_to_json(redact))
+    dumpdir = None
+    dumptenant = None
+    if '--cfgdir' in sys.argv:
+        dumpdir = sys.argv[sys.argv.index('--cfgdir') + 1]
+    if '--tenant' in sys.argv:
+        dumptenant = sys.argv[sys.argv.index('--tenant') + 1]
+    statelessmode = True
+    if dumpdir is not None:
+        ConfigManager._cfgdir = dumpdir
+    ConfigManager._read_from_path()
+    sys.stdout.write(ConfigManager(dumptenant)._real_dump_to_json(redact))
 # some unit tests worth implementing:
 # set group attribute on lower priority group, result is that node should not
 # change

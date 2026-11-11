@@ -205,6 +205,7 @@ async def connect_to_leader(cert=None, name=None, leader=None, remote=None, isre
                 cfm._txcount = dbi.get('txcount', 0)
                 await cfm.ConfigManager(tenant=None)._load_from_json(dbjson,
                                                                sync=False)
+                await cfm.load_collective_tenants(dbjson)
                 cfm.commit_clear()
             except Exception as e:
                 print(repr(e))
@@ -681,7 +682,7 @@ async def handle_connection(connection, cert, request, local=False):
             await tlvdata.send(connection, cfm._dump_keys(None, False))
             await tlvdata.send(connection, cfm._cfgstore['collective'])
             await tlvdata.send(connection, {'confluent_uuid': cfm.get_global('confluent_uuid')}) # cfm.get_globals())
-            cfgdata = await cfm.ConfigManager(None)._dump_to_json()
+            cfgdata = await cfm.dump_collective_payload()
             try:
                 await tlvdata.send(connection, {'txcount': cfm._txcount,
                                 'dbsize': len(cfgdata)})
@@ -700,8 +701,7 @@ async def handle_connection(connection, cert, request, local=False):
                     log.log({'info': 'Ignoring non-fatal error while closing collective connection: {0}'.format(e),
                              'subsystem': 'collective'})
                 raise
-        #tlvdata.send(connection, {'tenants': 0}) # skip the tenants for now,
-        # so far unused anyway
+        # Tenants travel inside cfgdata (see configmanager.dump_collective_payload)
         #connection.settimeout(90)
         if not await cfm.relay_slaved_requests(drone, connection):
             log.log({'info': 'All clients have disconnected, starting recovery process',
