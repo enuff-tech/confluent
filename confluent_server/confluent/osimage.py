@@ -6,7 +6,9 @@ import logging
 logging.getLogger('libarchive').addHandler(logging.NullHandler())
 import libarchive
 import hashlib
+import json
 import os
+import re
 try:
     from io import BytesIO
     import pycdlib
@@ -115,6 +117,69 @@ def tenant_media(tenant, name):
         raise exc.InvalidArgumentException(
             'No such media: {0}'.format(name))
     return found
+
+
+# libarchive: ARCHIVE_EXTRACT_SECURE_SYMLINKS, _SECURE_NODOTDOT,
+# _SECURE_NOABSOLUTEPATHS
+EXTRACT_SECURE = 0x0100 | 0x0200 | 0x10000
+# What media may call itself (names become directory names).
+MEDIA_NAME_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$')
+IDENTIFY_SECONDS = 180
+WORKER_CPU_SECONDS = 4 * 3600
+WORKER_MEMORY = 4 * 2 ** 30
+WORKER_FILE_SIZE = 64 * 2 ** 30
+
+
+def checked_identity(identity):
+    """The identity read from a tenant's media, if it is one the service
+    will act on: its names become directories and select the packaged
+    profile content, so they are held to plain names."""
+    if not isinstance(identity, dict):
+        raise exc.InvalidArgumentException('Unsupported Media')
+    for field in ('name', 'subname', 'category'):
+        value = identity.get(field)
+        if value is None and field != 'name':
+            continue
+        if not isinstance(value, str) or not MEDIA_NAME_RE.match(value):
+            raise exc.InvalidArgumentException('Unsupported Media')
+    return identity
+
+
+def _limit_worker():
+    # A process handling a tenant's media: bounded in time, memory and
+    # the size of any file it writes, and in a session of its own.
+    import resource
+    os.setsid()
+    os.umask(0o022)
+    resource.setrlimit(resource.RLIMIT_CPU, (WORKER_CPU_SECONDS, WORKER_CPU_SECONDS))
+    resource.setrlimit(resource.RLIMIT_AS, (WORKER_MEMORY, WORKER_MEMORY))
+    resource.setrlimit(resource.RLIMIT_FSIZE, (WORKER_FILE_SIZE, WORKER_FILE_SIZE))
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+
+
+async def identify_in_worker(filename):
+    """What fingerprint() says about a media file, found out by a worker
+    process: a tenant's media is not parsed inside the service."""
+    worker = await asyncio.create_subprocess_exec(
+        sys.executable, __file__, filename, '--identify',
+        stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL, preexec_fn=_limit_worker,
+        env=dict(os.environ, CONFLUENT_IMAGE_BASE=image_base()))
+    try:
+        output, _ = await asyncio.wait_for(worker.communicate(), IDENTIFY_SECONDS)
+    except asyncio.TimeoutError:
+        worker.kill()
+        await worker.wait()
+        raise exc.InvalidArgumentException('Unsupported Media')
+    if worker.returncode != 0 or len(output) > 65536:
+        raise exc.InvalidArgumentException('Unsupported Media')
+    try:
+        identity = json.loads(output.decode('utf8'))
+    except ValueError:
+        raise exc.InvalidArgumentException('Unsupported Media')
+    if identity is None:
+        return None
+    return checked_identity(identity), None, None
 
 
 def relax_umask():
@@ -346,6 +411,10 @@ def extract_entries(entries, flags=0, callback=None, totalsize=None, extractlist
     buff_p, size_p, offset_p = byref(buff), byref(size), byref(offset)
     sizedone = 0
     printat = 0
+    # Whatever the media says, nothing is written outside the directory
+    # being extracted into: not through a link it brought, '..', or an
+    # absolute name.
+    flags |= EXTRACT_SECURE
     with libarchive.extract.new_archive_write_disk(flags) as write_p:
         for entry in entries:
             if str(entry).endswith('TRANS.TBL'):
@@ -369,7 +438,11 @@ def extract_entries(entries, flags=0, callback=None, totalsize=None, extractlist
                     break
                 write_data_block(write_p, buff, size, offset)
             write_finish_entry(write_p)
-            if os.path.isdir(str(entry)):
+            if os.path.islink(str(entry)):
+                # (a link the media brought: what it points at is not
+                # this import's to change)
+                pass
+            elif os.path.isdir(str(entry)):
                 # This directory must be world accessible for web server
                 os.chmod(str(entry), 0o755)  # nosec
             else:
@@ -386,6 +459,7 @@ def extract_udf(archfile, callback=lambda x: None):
     fp = os.fdopen(dfd, 'rb')
     udf = pycdlib.PyCdlib()
     udf.open_fp(fp)
+    here = os.path.realpath('.')
     for dirent in udf.walk(udf_path='/'):
         for filent in dirent[2]:
             currfile = os.path.join(dirent[0], filent)
@@ -393,6 +467,10 @@ def extract_udf(archfile, callback=lambda x: None):
             if currfile[0] == '/':
                 relfile = currfile[1:]
             targfile = os.path.join('.', relfile)
+            # (nothing the media names is written outside this directory)
+            if '..' in relfile.split('/') or not os.path.realpath(
+                    os.path.dirname(os.path.join(here, relfile)) + os.sep).startswith(here + os.sep):
+                raise ValueError('Media names a file outside itself: ' + currfile)
             if os.path.exists(targfile):
                 os.unlink(targfile)
             os.makedirs(os.path.dirname(targfile), exist_ok=True)
@@ -1143,6 +1221,9 @@ async def import_image(filename, callback, backend=False, mfd=None, custtargpath
     if not identity:
         return -1
     identity, imginfo, funname = identity
+    if image_base() != STOCK_BASE:
+        # a tenant's media: the names it gives itself become paths
+        checked_identity(identity)
     distpath = custdistpath
     if distpath is None:
         targpath = identity['name']
@@ -1421,8 +1502,13 @@ class MediaImporter(object):
             medfile = self.medfile
         else:
             medfile = open(media, 'rb')
+        self.limited = cfm is not None and cfm.tenant is not None
         try:
-            identity = await asyncio.to_thread(fingerprint, medfile)
+            if self.limited:
+                # a tenant's media: read by a worker, its names checked
+                identity = await host_task(identify_in_worker(media))
+            else:
+                identity = await asyncio.to_thread(fingerprint, medfile)
         finally:
             if not self.medfile:
                 medfile.close()
@@ -1499,6 +1585,7 @@ class MediaImporter(object):
             sys.executable, __file__, self.filename, '-b',
             self.targpath, self.distpath, self.customname,
             stdout=asyncio.subprocess.PIPE, close_fds=False,
+            preexec_fn=_limit_worker if self.limited else None,
             env=dict(os.environ, CONFLUENT_IMAGE_BASE=self.base))
         wkr = self.worker
         currline = b''
@@ -1572,6 +1659,16 @@ def get_importing_status(importkey):
 
 if __name__ == '__main__':
     os.umask(0o022)
+    if len(sys.argv) == 3 and sys.argv[2] == '--identify':
+        # tell what a media file is, and nothing else (see identify_in_worker)
+        with open(sys.argv[1], 'rb') as _media:
+            _found = fingerprint(_media)
+        _identity = _found[0] if _found else None
+        if isinstance(_identity, dict):
+            _identity = dict((k, v) for k, v in _identity.items()
+                             if isinstance(v, (str, int, bool, type(None))))
+        sys.stdout.write(json.dumps(_identity))
+        sys.exit(0)
     if len(sys.argv) > 2:
         mfd = os.environ.get('CONFLUENT_MEDIAFD', None)
         asyncio.run(import_image(sys.argv[1], callback=printit, backend=True, mfd=mfd, custtargpath=sys.argv[3], custdistpath=sys.argv[4], custname=sys.argv[5]))

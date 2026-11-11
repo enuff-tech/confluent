@@ -50,6 +50,7 @@ import confluent.networking.macmap as macmap
 import confluent.networking.tenantnetcfg as tenantnetcfg
 import confluent.noderange as noderange
 import confluent.osimage as osimage
+import confluent.tenantmedia as tenantmedia
 import confluent.tenantpaths as tenantpaths
 import confluent.tenantsite as tenantsite
 import confluent.plugin as plugin
@@ -212,6 +213,8 @@ async def handle_deployment(configmanager, inputdata, pathcomponents,
         yield msg.ChildCollection('distributions/')
         yield msg.ChildCollection('profiles/')
         yield msg.ChildCollection('importing/')
+        if configmanager.tenant is not None:
+            yield msg.ChildCollection('media/')
         return
     if pathcomponents[1] == 'distributions':
         if len(pathcomponents) == 2 and operation == 'retrieve':
@@ -264,6 +267,26 @@ async def handle_deployment(configmanager, inputdata, pathcomponents,
                     for cust in customized:
                         yield msg.KeyValueData({'customized': cust})
                     return
+    if pathcomponents[1] == 'media':
+        # media a tenant uploaded and has not imported yet (the upload
+        # itself is a stream, taken by the HTTP API)
+        tenant = configmanager.tenant
+        if len(pathcomponents) == 2 and operation == 'retrieve':
+            for name in tenantmedia.listing(tenant):
+                yield msg.ChildCollection(name)
+            return
+        if len(pathcomponents) == 3 and operation == 'retrieve':
+            waiting = tenantmedia.listing(tenant)
+            if pathcomponents[2] not in waiting:
+                raise exc.NotFoundException('No such media')
+            yield msg.KeyValueData({'name': pathcomponents[2],
+                                    'size': waiting[pathcomponents[2]]})
+            return
+        if len(pathcomponents) == 3 and operation == 'delete':
+            tenantmedia.remove(tenant, pathcomponents[2])
+            yield msg.DeletedResource('deployment/media/' + pathcomponents[2])
+            return
+        raise exc.InvalidArgumentException('Media are uploaded with the HTTP API')
     if pathcomponents[1] == 'fingerprint':
         if operation == 'create':
             importer = osimage.MediaImporter()

@@ -103,7 +103,7 @@ that created them and carry scopes, an expiry and can be revoked.
 | Consoles and shell sessions | Yes: `ipmi`, `redfish`, `openbmc`, `tsmsol` consoles, ssh shells |
 | Alert decoding (`/events/decode`) | Yes, for its own nodes |
 | Network boot and deployment | UEFI HTTP boot and iPXE from the tenant's own content; see Deployment |
-| OS images and profiles (`/deployment`) | Yes, tenant administrators: import from the tenant's media directory, list, rebuild boot files, rebase |
+| OS images and profiles (`/deployment`) | Yes, tenant administrators: upload media, import it, list, rebuild boot files, rebase |
 | Firmware updates, media, licenses, certificate signing for BMCs, power reseat | Not yet |
 | Remote configuration (ansible, file synchronization), SSH certificates, identity images | Not yet |
 | The web interface | Default tenant only |
@@ -186,19 +186,41 @@ service as its nodes know it, and both packed for the boot images) is
 made by the service. The certificate authority is also at
 `/confluent-public/site/tls/ca.pem`.
 
-A tenant administrator imports OS installation media and manages the
-profiles made from them through `/deployment`, as in a single-tenant
-installation:
+A tenant administrator uploads OS installation media, imports it, and
+manages the profiles made from it through `/deployment`:
 
+    PUT  /deployment/media/<name>      (the media itself as the body)
+    GET  /deployment/media/
+    DELETE /deployment/media/<name>
     POST /deployment/importing/        {"filename": "Rocky-9.4-x86_64-dvd.iso"}
     GET  /deployment/importing/<name>
     GET  /deployment/profiles/
     PUT  /deployment/profiles/<name>   {"updateboot": 1}
     PUT  /deployment/profiles/<name>   {"rebase": 1}
 
+For example:
+
+    curl -u acme/admin -T Rocky-9.4-x86_64-dvd.iso \
+        https://confluent.example.com/confluent-api/deployment/media/Rocky-9.4-x86_64-dvd.iso
+
+An upload states its size (`Content-Length`) and is refused before any of
+it is read when the tenant may not keep it. Media stays in the tenant's
+`media` directory, also after it was imported, until it is deleted. What
+a tenant may keep there is set in `/etc/confluent/service.cfg`:
+
+    [tenants]
+    media_max_gb = 16        # largest single media file
+    media_quota_gb = 64      # total a tenant may keep waiting
+    media_reserve_gb = 20    # space the volume must keep free
+
 `filename` names a file in the tenant's `media` directory, never a path
 of the host. The tools this takes (unpacking media, building boot images)
-run as the service itself, on the tenant's trees only. Ready-made profile
+run as the service itself, on the tenant's trees only. A tenant's media
+is not trusted: it is identified and unpacked by worker processes limited
+in time, memory and file size, nothing it contains is written outside the
+directory it is unpacked into, and the names it gives itself have to be
+plain ones. Those workers still run as the service user (see Security
+boundaries). Ready-made profile
 archives are not imported within a tenant, and rebasing only copies from
 the product's packaged profile content. Profiles are not editable through
 the API: customizing one (kernel arguments, scripts) is done in the
@@ -253,9 +275,9 @@ turned on.
 
 - The host's root user and the confluent service user can see everything
   (see Security boundaries).
-- A tenant's media has to be placed in its media directory on the host,
-  and its profiles are customized there: neither can be done through the
-  API yet. Firmware updates, virtual media, remote configuration, SSH
+- A tenant's profiles are customized in its tree on the host: that
+  cannot be done through the API yet. Firmware updates, virtual media,
+  remote configuration, SSH
   certificates and identity images are not available to tenants.
 - Each tenant keeps its own copy of the OS images it imports.
 - TFTP boot is not available to tenants.

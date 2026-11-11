@@ -22,6 +22,7 @@ starts no process) and act on that tenant's tree only.
 
 import asyncio
 import io
+import json
 import os
 import tarfile
 
@@ -83,6 +84,16 @@ class FakeWorker(object):
         pass
 
 
+class IdentifyWorker(FakeWorker):
+    """The process that reads what a tenant's media is."""
+
+    def __init__(self, output):
+        self.output = output
+
+    async def communicate(self):
+        return self.output, None
+
+
 @pytest.fixture
 async def images(confluent_config, monkeypatch, tmp_path):
     configmanager.init_masterkey()
@@ -111,7 +122,14 @@ async def images(confluent_config, monkeypatch, tmp_path):
             cmd = tuple(cmd[0])
         ran.append((tenantguard.current_tenant.get(), tenantnet.current_network(), cmd))
 
+    identified = []
+
     async def spawn(*args, **kwargs):
+        if args[3:4] == ('--identify',):
+            identified.append((tenantguard.current_tenant.get(), args[2],
+                               kwargs.get('preexec_fn')))
+            found = osimage.fingerprint(None)
+            return IdentifyWorker(json.dumps(found[0] if found else None).encode())
         ran.append((tenantguard.current_tenant.get(), tenantnet.current_network(),
                     ('worker',) + tuple(args[2:]), kwargs.get('env', {}).get('CONFLUENT_IMAGE_BASE')))
         # what the worker does: unpack the media into the distribution
@@ -124,7 +142,7 @@ async def images(confluent_config, monkeypatch, tmp_path):
         {'name': OSNAME, 'method': osimage.EXTRACT, 'category': 'el9'}, None, 'rocky'))
     for tid, name in ((A, 'acme'), (B, 'globex')):
         _create(tid, name)
-    yield {'base': base, 'templates': templates, 'ran': ran}
+    yield {'base': base, 'templates': templates, 'ran': ran, 'identified': identified}
     tenantnet.enter(None)
 
 
@@ -289,6 +307,45 @@ async def test_media_is_only_ever_the_tenants_own(images):
             await _as(A, '/deployment/importing/', 'create',
                       {'filename': 'ok.iso', 'custname': custom})
     assert osimage.tenant_media(B, 'only-b.iso').endswith('/media/only-b.iso')
+
+
+async def test_a_tenants_media_is_read_by_a_limited_worker(images, monkeypatch):
+    await _import(A)
+    # found out by a process of the service, limited, not within the tenant
+    assert images['identified'] == [
+        (None, os.path.join(tenantpaths.media_root(A), 'rocky.iso'), osimage._limit_worker)]
+    spawned = []
+    real = osimage.asyncio.create_subprocess_exec
+
+    async def spawn(*args, **kwargs):
+        spawned.append(kwargs.get('preexec_fn'))
+        return await real(*args, **kwargs)
+    monkeypatch.setattr(osimage.asyncio, 'create_subprocess_exec', spawn)
+    await _import(B)
+    assert spawned == [osimage._limit_worker, osimage._limit_worker]
+
+
+@pytest.mark.parametrize('identity', [
+    {'name': '../../../escape'}, {'name': 'a/b'}, {'name': '..'}, {'name': ''},
+    {'name': '.hidden'}, {'name': 'x' * 65}, {'name': 7}, {},
+    {'name': 'rocky-9.4-x86_64', 'subname': '../1'},
+    {'name': 'rocky-9.4-x86_64', 'category': '../../../../etc'},
+    {'name': 'rocky-9.4-x86_64', 'category': 'el9/../../x'},
+    ['rocky-9.4-x86_64'], 'rocky-9.4-x86_64',
+])
+async def test_what_media_calls_itself_is_held_to_plain_names(images, monkeypatch, identity):
+    # the names media gives itself become directories of the tenant
+    if isinstance(identity, dict):
+        identity = dict(identity, method=osimage.EXTRACT)
+    monkeypatch.setattr(osimage, 'fingerprint', lambda archive: (identity, None, 'rocky'))
+    await tenantsite.ensure(A)
+    _write(os.path.join(tenantpaths.media_root(A), 'odd.iso'), b'x')
+    with pytest.raises(exc.InvalidArgumentException, match='Unsupported Media'):
+        await _as(A, '/deployment/importing/', 'create', {'filename': 'odd.iso'})
+    with pytest.raises(exc.InvalidArgumentException):
+        await _as(A, '/deployment/fingerprint/', 'create', {'filename': 'odd.iso'})
+    assert not [e for e in images['ran'] if e[2][0] == 'worker']
+    assert await _as(A, '/deployment/distributions/') == []
 
 
 async def test_ready_made_profiles_are_not_imported_within_a_tenant(images, monkeypatch):
