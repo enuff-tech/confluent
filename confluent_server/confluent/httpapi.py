@@ -33,6 +33,7 @@ import asyncio
 from aiohttp import web, WSMsgType
 import confluent.apikey as apikey
 import confluent.tenancy as tenancy
+import confluent.tenantmedia as tenantmedia
 import confluent.tenantnet as tenantnet
 import confluent.auth as auth
 import confluent.config.attributes as attribs
@@ -821,7 +822,8 @@ async def resourcehandler_backend(req, make_response):
         redir = '/confluent-public/os/{0}/boot.{1}'.format(pprofile, bootfile)
         rsp = await make_response(mimetype, 302, 'Found', {'Location': redir})
         return rsp
-    if req.content_length and '/staging' not in reqpath:
+    if (req.content_length and '/staging' not in reqpath
+            and not reqpath.startswith('/deployment/media/')):
         reqbody = await req.read()
         reqtype = req.content_type
     operation = opmap.get(req.method, None)
@@ -880,6 +882,20 @@ async def resourcehandler_backend(req, make_response):
         raise Exception("Unrecognized code from auth engine")
     cookies = authorized.get('cookie', None)
     cfgmgr = authorized['cfgmgr']
+    if reqpath.startswith('/deployment/media/') and operation in ('create', 'update'):
+        # A tenant's OS media, streamed to its media directory (never held
+        # in memory, never read before the request is authorized).
+        try:
+            name = reqpath[len('/deployment/media/'):]
+            size = await tenantmedia.receive(
+                cfgmgr.tenant, name, req.content, req.content_length)
+        except exc.ConfluentException as e:
+            rsp = await make_response(mimetype, e.apierrorcode, e.apierrorstr)
+            await rsp.write(e.get_error_body().encode('utf8'))
+            return rsp
+        rsp = await make_response('application/json', 201, 'Created', cookies=cookies)
+        await rsp.write(json.dumps({'media': name, 'size': size}).encode('utf8'))
+        return rsp
     if (operation == 'create') and reqpath == '/sessions/current/async':
         pagecontent = ""
         try:
