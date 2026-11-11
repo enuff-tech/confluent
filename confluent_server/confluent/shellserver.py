@@ -20,7 +20,9 @@
 
 
 import asyncio
+import confluent.config.configmanager as configmanager
 import confluent.consoleserver as consoleserver
+import contextvars
 import confluent.exceptions as exc
 import confluent.messages as msg
 import confluent.tasks as tasks
@@ -40,6 +42,29 @@ async def reapsessions():
                     await currsess.close()
                     del activesessions[clientid][sesshdl]
 
+async def close_tenant(tenant):
+    """End every shell session on a tenant's nodes (it is no longer in
+    use)."""
+    for key in [k for k in activesessions if k[0] == tenant]:
+        for handler in list(activesessions.pop(key).values()):
+            try:
+                await handler.close()
+            except Exception:
+                pass
+
+
+def _tenant_state_changed(tenant, state):
+    if state != 'active':
+        try:
+            tasks.spawn(close_tenant(tenant))
+        except RuntimeError:  # no event loop (configuration tools)
+            pass
+
+
+# before the tenant's network closes the sockets its sessions use
+configmanager.watch_tenant_state(_tenant_state_changed, first=True)
+
+
 class _ShellHandler(consoleserver.ConsoleHandler):
     _plugin_path = '/nodes/{0}/_shell/session'
     _genwatchattribs = False
@@ -51,7 +76,8 @@ class _ShellHandler(consoleserver.ConsoleHandler):
         self.numusers = 0
         global _reaper
         if _reaper is None:
-            _reaper = tasks.spawn(reapsessions())
+            # one reaper for the service, outside any tenant
+            _reaper = contextvars.Context().run(tasks.spawn, reapsessions())
 
 
     async def check_collective(self, attrvalue):

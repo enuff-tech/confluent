@@ -32,7 +32,10 @@ import confluent.log as log
 import confluent.core as plugin
 import confluent.asynctlvdata as tlvdata
 import confluent.tasks as tasks
+import confluent.tenantguard as tenantguard
+import confluent.tenantnet as tenantnet
 import confluent.util as util
+import contextvars
 import socket
 import random
 import struct
@@ -51,6 +54,9 @@ def chunk_output(output, n):
 
 async def get_buffer_connection():
     out = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    # the service's own terminal buffer daemon on this host, not a network:
+    # also used while working for a tenant
+    tenantguard.register_control(out)
     out.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
     try:
         out.connect("\x00confluent-vtbuffer")
@@ -71,7 +77,9 @@ async def _ensure_buffer_daemon():
     async with _bufferstartuplock:
         if _bufferdaemon is not None:
             return await get_buffer_connection()
-        tasks.spawn(run_buffer_daemon())
+        # the daemon is the service's, shared by all tenants: started
+        # outside any tenant, whichever task needed it first
+        contextvars.Context().run(tasks.spawn, run_buffer_daemon())
         await asyncio.sleep(0)  # yield control to allow buffer daemon to start
         deadline = time.time() + 0.5
         storedexception = None
@@ -166,6 +174,12 @@ class ConsoleHandler(object):
         self._retrytime = 0
         self.cfgmgr = configmanager
         self.node = node
+        # Connections to the console are made in the network of the node's
+        # tenant, whichever task creates this handler or asks it to
+        # reconnect (a user of the tenant, the service at startup, a
+        # configuration change replicated from another member).
+        self._tenantctx = contextvars.copy_context()
+        self._tenantctx.run(tenantnet.enter, configmanager.tenant)
         self.connectstate = 'unconnected'
         self._isalive = True
         #self.buffer = pyte.Screen(100, 31)
@@ -198,7 +212,18 @@ class ConsoleHandler(object):
         if self._genwatchattribs:
             self._attribwatcher = self.cfgmgr.watch_attributes(
                 (self.node,), self._genwatchattribs, self._attribschanged)
-        tasks.spawn(self.ondemand_init())
+        self._spawn_for_tenant(tasks.spawn, self.ondemand_init())
+
+    def _spawn_for_tenant(self, spawn, coro):
+        """Start coro as a task working for this console's tenant."""
+        return self._tenantctx.copy().run(spawn, coro)
+
+    def _bufferid(self):
+        """The name of this terminal in the buffer daemon: node names
+        repeat between tenants, their terminals do not."""
+        if self.cfgmgr.tenant is None:
+            return self.termprefix + self.node
+        return '{0}/{1}{2}'.format(self.cfgmgr.tenant, self.termprefix, self.node)
 
     async def ondemand_init(self):
         await self.clearbuffer()
@@ -226,7 +251,7 @@ class ConsoleHandler(object):
         if self.pendingbytes is not None:
             self.pendingbytes += data
         self.pendingbytes = b''
-        nodeid = self.termprefix + self.node
+        nodeid = self._bufferid()
         try:
             await send_output(nodeid, data)
             data = self.pendingbytes
@@ -364,7 +389,8 @@ class ConsoleHandler(object):
         if self.connectionthread:
             self.connectionthread.cancel()
             self.connectionthread = None
-        self.connectionthread = tasks.spawn_task(self._connect_backend())
+        self.connectionthread = self._spawn_for_tenant(
+            tasks.spawn_task, self._connect_backend())
 
     async def _connect_backend(self):
         if self._console:
@@ -586,7 +612,7 @@ class ConsoleHandler(object):
             'connectstate': self.connectstate,
             'clientcount': len(self.livesessions),
         }
-        nodeid = self.termprefix + self.node
+        nodeid = self._bufferid()
         retdata = await get_buffer_output(nodeid)
         return retdata, connstate
 
@@ -623,9 +649,12 @@ def _nodechange(added, deleting, renamed, configmanager):
 
 async def _start_tenant_sessions(cfm):
     if cfm.tenant is not None:
-        # Console connections are made from the host's network; tenant
-        # consoles wait until they can be made within the tenant's own.
-        return
+        record = configmodule.get_tenant(cfm.tenant)
+        if not (configmodule.multitenancy_enabled() and record
+                and record['state'] == 'active'):
+            return  # consoles of a tenant that is not in use stay closed
+        if cfm.tenant in _tenant_nodewatchers:
+            return  # already started
     nodeattrs = cfm.get_node_attributes(cfm.list_nodes(), 'collective.manager')
     for node in nodeattrs:
         manager = nodeattrs[node].get('collective.manager', {}).get('value',
@@ -637,8 +666,46 @@ async def _start_tenant_sessions(cfm):
         except:
             _tracelog.log(traceback.format_exc(), ltype=log.DataTypes.event,
                           event=log.Events.stacktrace)
-    cfm.watch_nodecollection(_nodechange)
+    watcher = cfm.watch_nodecollection(_nodechange)
+    if cfm.tenant is not None:
+        _tenant_nodewatchers[cfm.tenant] = watcher
 
+
+_tenant_nodewatchers = {}
+
+
+async def close_tenant(tenant):
+    """Close every console of a tenant's nodes (it is no longer in use)."""
+    watcher = _tenant_nodewatchers.pop(tenant, None)
+    if watcher is not None and configmodule.get_tenant(tenant):
+        try:
+            configmodule.ConfigManager(tenant).remove_watcher(watcher)
+        except Exception:
+            pass
+    for consk in [k for k in _handled_consoles if k[1] == tenant]:
+        handler = _handled_consoles.pop(consk)
+        try:
+            await handler.close()
+        except Exception:
+            if _tracelog:
+                _tracelog.log(traceback.format_exc(), ltype=log.DataTypes.event,
+                              event=log.Events.stacktrace)
+
+
+def _tenant_state_changed(tenant, state):
+    try:
+        if state == 'active':
+            if _started:
+                tasks.spawn(_start_tenant_sessions(configmodule.ConfigManager(tenant)))
+        else:
+            tasks.spawn(close_tenant(tenant))
+    except RuntimeError:  # no event loop (configuration tools)
+        pass
+
+
+# before the tenant's network closes the sockets its consoles use
+configmodule.watch_tenant_state(_tenant_state_changed, first=True)
+_started = False
 running = True
 
 async def run_buffer_daemon():
@@ -669,6 +736,8 @@ async def initialize():
 
 
 async def start_console_sessions():
+    global _started
+    _started = True
     await configmodule.hook_new_configmanagers(_start_tenant_sessions)
 
 

@@ -206,7 +206,9 @@ async def test_enrollment_http_body(mt):
     ('/nodes/c1/configuration/management_controller/certificate/sign', 'update', False),
     ('/nodes/c1/configuration/management_controller/save_licenses', 'update', False),
     ('/nodes/c1/media/attach', 'update', False),
-    ('/nodes/c1/console/session', 'create', False),
+    ('/nodes/c1/console/session', 'create', True),
+    ('/nodes/c1/shell/sessions/', 'create', True),
+    ('/noderange/c1/console/session', 'create', False),
     ('/noderange/c1/power/state', 'update', True),
     ('/discovery/rescan', 'update', True),
     ('/discovery/by-mac/02-00-00-aa-34-02', 'delete', True),
@@ -318,16 +320,24 @@ async def test_host_accounts_never_authenticate_tenant_users(mt, monkeypatch):
     assert not _ok(auth.authorize('acme/root', '/nodes/', operation='retrieve'))
 
 
-async def test_tenant_consoles_are_not_started(mt, monkeypatch):
+async def test_consoles_start_only_for_tenants_in_use(mt, monkeypatch):
     import confluent.consoleserver as consoleserver
     tid = await _tenant('acme')
     await configmanager.ConfigManager(tid).set_node_attributes(
         {'c1': {'console.method': 'ipmi'}}, autocreate=True)
+    started = []
 
-    async def refuse(*args, **kwargs):
-        raise AssertionError('a tenant console was started from the host network')
-    monkeypatch.setattr(consoleserver, 'connect_node', refuse)
+    async def connect(node, cfm, *args, **kwargs):
+        started.append((cfm.tenant, node))
+    monkeypatch.setattr(consoleserver, 'connect_node', connect)
+    monkeypatch.setattr(consoleserver, '_tenant_nodewatchers', {})
+    await configmanager.set_tenant_state(tid, 'disabled')
     await consoleserver._start_tenant_sessions(configmanager.ConfigManager(tid))
+    assert started == []
+    await configmanager.set_tenant_state(tid, 'active')
+    await consoleserver._start_tenant_sessions(configmanager.ConfigManager(tid))
+    await consoleserver._start_tenant_sessions(configmanager.ConfigManager(tid))
+    assert started == [(tid, 'c1')]  # once
 
 
 # --------------------------------------------------------------- API keys
@@ -422,7 +432,7 @@ async def test_http_tenant_login_and_session(http):
     assert http.httpsessions[session]['tenant'] == acme
     reused = await _request(http, 'POST', '/nodes/', session=session)
     assert reused['cfgmgr'].tenant == acme  # not the default tenant's Monitor 'admin'
-    assert (await _request(http, 'POST', '/nodes/c1/console/session', session=session)) == {'code': 403}
+    assert (await _request(http, 'POST', '/nodes/c1/power/reseat', session=session)) == {'code': 403}
     await configmanager.set_tenant_state(acme, 'disabled')
     assert (await _request(http, 'GET', '/nodes/', session=session))['code'] == 403
 
