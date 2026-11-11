@@ -200,7 +200,8 @@ async def test_site_content_is_the_tenants_own(images):
             packed = f.read()
         assert len(packed) % 512 == 0
         names = _cpio_names(packed)
-        assert list(names) == ['confluent_uuid', 'tls', 'tls/' + tid + '.pem']
+        assert list(names) == [
+            'confluent_uuid', 'ssh', 'ssh/' + tid + '.ca', 'tls', 'tls/' + tid + '.pem']
         assert names['tls/' + tid + '.pem'] == authority
         with open(os.path.join(site, 'initramfs.tgz'), 'rb') as f:
             tar = tarfile.open(fileobj=io.BytesIO(f.read()))

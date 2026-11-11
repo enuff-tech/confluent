@@ -30,7 +30,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.asymmetric import ec, ed25519
 from cryptography.x509.oid import NameOID
 
 import confluent.config.configmanager as configmanager
@@ -42,6 +42,7 @@ import confluent.tenantguard as tenantguard
 import confluent.tenantnet as tenantnet
 import confluent.tenantpaths as tenantpaths
 import confluent.tenantservices as services
+import confluent.tenantssh as tenantssh
 from tenanttopo import HW_IP, TENANTS, UP_IP, Topology
 
 A, B = sorted(TENANTS)
@@ -475,6 +476,21 @@ async def test_deployment_api_answers_from_the_tenants_configuration(topo):
     assert cert.issuer == authority.subject
     names = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
     assert ADDRESS[A] in [str(ip) for ip in names.get_values_for_type(x509.IPAddress)]
+    # and one for its SSH host key, from its tenant's SSH authority
+    if tenantssh.available():
+        hostkey = ed25519.Ed25519PrivateKey.generate().public_key().public_bytes(
+            serialization.Encoding.OpenSSH, serialization.PublicFormat.OpenSSH)
+        answer = await _fetch(topo, A, 'https://%s/confluent-api/self/sshcert' % UP_IP,
+                              key=KEY, body=hostkey)
+        assert answer.get('status') == 200, answer
+        sshcert = serialization.load_ssh_public_identity(answer['body'])
+        sshcert.verify_cert_signature()
+        assert b'n1' in sshcert.valid_principals
+        assert ADDRESS[A].encode() in sshcert.valid_principals
+        signer = sshcert.signature_key().public_bytes(
+            serialization.Encoding.OpenSSH, serialization.PublicFormat.OpenSSH)
+        assert tenantssh.ca_public(A).startswith(signer + b' ')
+        assert not tenantssh.ca_public(B).startswith(signer + b' ')
     # status reports land in the reporting node's tenant
     answer = await _fetch(topo, A, 'https://%s/confluent-api/self/updatestatus' % UP_IP,
                           key=KEY, body=b'status: complete\n')

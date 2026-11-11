@@ -33,6 +33,7 @@ import tarfile
 import confluent.config.configmanager as configmanager
 import confluent.tenantca as tenantca
 import confluent.tenantpaths as tenantpaths
+import confluent.tenantssh as tenantssh
 
 IPXE_SOURCE = '/opt/confluent/lib/ipxe'
 IPXE_FILES = ('ipxe-shim.efi', 'ipxe.efi', 'ipxe-aarch64-shim.efi', 'ipxe-aarch64.efi')
@@ -110,6 +111,10 @@ async def ensure(tenant):
     _write(os.path.join(sitedir, 'confluent_uuid'), (cfm.service_uuid() + '\n').encode())
     # the one authority this tenant's nodes trust for their server
     _write(os.path.join(sitedir, 'tls', tenant + '.pem'), await tenantca.ca_pem(tenant))
+    if tenantssh.available():
+        # and the one that signs the SSH host keys of its nodes
+        _mkdir(os.path.join(sitedir, 'ssh'))
+        _write(os.path.join(sitedir, 'ssh', tenant + '.ca'), tenantssh.ca_public(tenant))
     names = _members(sitedir)
     _write(os.path.join(sitedir, 'initramfs.cpio'), pack_cpio(sitedir, names))
     packed = io.BytesIO()

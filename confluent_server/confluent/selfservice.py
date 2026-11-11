@@ -4,7 +4,9 @@ import confluent.config.configmanager as configmanager
 import confluent.collective.manager as collective
 import confluent.netutil as netutil
 import confluent.noderange as noderange
+import confluent.exceptions as exc
 import confluent.sshutil as sshutil
+import confluent.tenantssh as tenantssh
 import confluent.util as util
 from confluent import certutil
 import confluent.tenantca as tenantca
@@ -119,10 +121,11 @@ async def get_extra_names(nodename, cfg, myip=None, preferadjacent=False, addloc
             names.update(routedaddrs)
     return names
 
-# What a tenant's nodes may ask for. SSH certificates, remote
-# configuration (ansible, file synchronization) and remote BMC
-# configuration are not available within tenants yet.
+# What a tenant's nodes may ask for. Remote configuration (ansible, file
+# synchronization) and remote BMC configuration are not available within
+# tenants yet.
 TENANT_PATHS = frozenset([
+    '/self/sshcert', '/self/sshcertready',
     '/self/bmcconfig', '/self/myattribs', '/self/netcfg', '/self/nodelist',
     '/self/updatestatus', '/self/saveapikey', '/self/deploycfg',
     '/self/deploycfg2', '/self/tlscert',
@@ -499,6 +502,20 @@ async def handle_request(req, make_response, mimetype, tenant=None,
                 cert = certf.read()
             os.unlink(certname)
             return await make_response('application/x-pem-file', 200, 'OK', body=cert)
+    elif reqpath == '/self/sshcertready' and tenant is not None:
+        # (a tenant's authority signs in the service itself: there is
+        # nothing to queue for, and no table shared between tenants)
+        return await make_response(mimetype, 200, 'OK', body='Reserved')
+    elif reqpath == '/self/sshcert' and reqbody and tenant is not None:
+        # signed by the authority of the node's own tenant
+        try:
+            pals = await get_extra_names(nodename, cfg, myip)
+            cert = tenantssh.sign_host_key(tenant, reqbody, nodename, pals)
+        except exc.InvalidArgumentException as e:
+            return await make_response(mimetype, 400, 'Bad Request', body=str(e))
+        except exc.NotImplementedException as e:
+            return await make_response(mimetype, 501, 'Not Implemented', body=str(e))
+        return await make_response('text/plain', 200, 'OK', body=cert.encode())
     elif reqpath == '/self/sshcertready':
         cleanup_inflight_sshcerts()
         if nodename not in inflight_sshcerts and len(inflight_sshcerts) >= MAX_INFLIGHT_SSHCERTS:

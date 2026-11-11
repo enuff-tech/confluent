@@ -105,7 +105,8 @@ that created them and carry scopes, an expiry and can be revoked.
 | Network boot and deployment | UEFI HTTP boot and iPXE from the tenant's own content; see Deployment |
 | OS images and profiles (`/deployment`) | Yes, tenant administrators: upload media, import it, list, rebuild boot files, rebase |
 | Firmware updates, media, licenses, certificate signing for BMCs, power reseat | Not yet |
-| Remote configuration (ansible, file synchronization), SSH certificates, identity images | Not yet |
+| SSH host certificates for nodes (`/self/sshcert`) | Yes, from the tenant's own SSH certificate authority |
+| Remote configuration (ansible, file synchronization), identity images | Not yet |
 | The web interface | Default tenant only |
 
 Anything not available answers with an error; it never falls back to the
@@ -185,6 +186,16 @@ packaged content (`/opt/confluent`), and nowhere else. The site content
 service as its nodes know it, and both packed for the boot images) is
 made by the service. The certificate authority is also at
 `/confluent-public/site/tls/ca.pem`.
+
+Each tenant also has an SSH certificate authority of its own
+(`public/site/ssh/<id>.ca`, part of the site content its boot images
+carry). It signs the host keys of the tenant's nodes when they ask
+(`/self/sshcert`), so the nodes of a tenant recognize each other, and a
+host key signed for one tenant means nothing to the nodes of another. Its
+key is derived from the key the tenant's secrets are encrypted with and
+is not stored anywhere; it needs version 40 or later of the Python
+cryptography library. The service has no SSH key of its own that a
+tenant's nodes accept: it does not log in to them.
 
 A tenant administrator uploads OS installation media, imports it, and
 manages the profiles made from it through `/deployment`:
@@ -277,8 +288,7 @@ turned on.
   (see Security boundaries).
 - A tenant's profiles are customized in its tree on the host: that
   cannot be done through the API yet. Firmware updates, virtual media,
-  remote configuration, SSH
-  certificates and identity images are not available to tenants.
+  remote configuration and identity images are not available to tenants.
 - Each tenant keeps its own copy of the OS images it imports.
 - TFTP boot is not available to tenants.
 - A tenant's server certificate is issued when its listeners start
