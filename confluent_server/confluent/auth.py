@@ -156,7 +156,8 @@ _tenant_paths = [re.compile(p) for p in (
     # registration, rescan and autosense (all kept per tenant).
     r'^/discovery(/.*)?$',
     # The tenant's own switches: MAC tables and LLDP neighbors, read
-    # through its network with its own credentials.
+    # through its network with its own credentials; and the network the
+    # tenant manages in its own namespace (interfaces, routes, dns).
     r'^/networking(/.*)?$',
     # Decoding an alert (SNMP trap contents) of one of its own nodes.
     r'^/events(/decode)?/?$',

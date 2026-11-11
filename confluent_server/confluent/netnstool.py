@@ -72,6 +72,10 @@ def broker_user(tenantid):
     return 'cfnsb-' + _check_id(tenantid)
 
 
+def netcfg_user(tenantid):
+    return 'cfnet-' + _check_id(tenantid)
+
+
 def _run(*cmd, **kwargs):
     kwargs.setdefault('check', True)
     try:
@@ -148,15 +152,23 @@ def _links_in(namespace=None):
     return names
 
 
-def ensure_user(tenantid):
-    user = broker_user(tenantid)
+def _ensure_account(user, comment):
     try:
         pwd.getpwnam(user)
     except KeyError:
         _run('useradd', '--system', '--no-create-home', '--user-group',
-             '--shell', '/sbin/nologin', '--comment',
-             'confluent network broker for tenant ' + tenantid, user)
+             '--shell', '/sbin/nologin', '--comment', comment, user)
     return pwd.getpwnam(user)
+
+
+def ensure_user(tenantid):
+    return _ensure_account(broker_user(tenantid),
+                           'confluent network broker for tenant ' + tenantid)
+
+
+def ensure_netcfg_user(tenantid):
+    return _ensure_account(netcfg_user(tenantid),
+                           'confluent network configuration for tenant ' + tenantid)
 
 
 def setup(tenantid):
@@ -175,6 +187,20 @@ def setup(tenantid):
     os.chown(rundir, account.pw_uid, grp.getgrnam(SERVICE_GROUP).gr_gid)
     os.chmod(rundir, 0o2750)
     os.makedirs(os.path.join(paths['resolv'], namespace), mode=0o755, exist_ok=True)
+    # The configuration helper has an account and a socket directory of
+    # its own, and owns the one file it writes: the tenant's resolv.conf.
+    helper = ensure_netcfg_user(tenantid)
+    helperdir = os.path.join(rundir, 'netcfg')
+    os.makedirs(helperdir, exist_ok=True)
+    os.chown(helperdir, helper.pw_uid, grp.getgrnam(SERVICE_GROUP).gr_gid)
+    os.chmod(helperdir, 0o2750)
+    resolv = os.path.join(paths['resolv'], namespace, 'resolv.conf')
+    if not os.path.lexists(resolv):
+        with open(resolv, 'w'):
+            pass
+    if not os.path.islink(resolv):
+        os.chown(resolv, helper.pw_uid, helper.pw_gid)
+        os.chmod(resolv, 0o644)
     for uplink in load_config(tenantid)['uplinks']:
         attach_uplink(tenantid, uplink)
 
@@ -252,11 +278,12 @@ def teardown(tenantid, purge=False):
             os.unlink(_config_path(tenantid))
         except FileNotFoundError:
             pass
-        try:
-            pwd.getpwnam(broker_user(tenantid))
-            _run('userdel', broker_user(tenantid))
-        except KeyError:
-            pass
+        for user in (broker_user(tenantid), netcfg_user(tenantid)):
+            try:
+                pwd.getpwnam(user)
+                _run('userdel', user)
+            except KeyError:
+                pass
 
 
 def _remove_dir(root, name):

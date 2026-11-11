@@ -52,7 +52,7 @@ def test_unprivileged_operations(ctx):
     names = [i['name'] for i in result['interfaces']]
     assert error is None and 'lo' in names
     lo = [i for i in result['interfaces'] if i['name'] == 'lo'][0]
-    assert lo['ipv4'] == ['127.0.0.1/8'] and lo['up']
+    assert '127.0.0.1/8' in lo['ipv4'] and lo['up']  # every address is listed
 
 
 @pytest.mark.parametrize('op,args,code', [

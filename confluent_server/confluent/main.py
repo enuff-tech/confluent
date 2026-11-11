@@ -34,6 +34,7 @@ import confluent.config.conf as conf
 import confluent.config.configmanager as configmanager
 import confluent.tenantguard as tenantguard
 import confluent.tenantservices as tenantservices
+import confluent.networking.tenantnetcfg as tenantnetcfg
 import confluent.tenantnet as tenantnet  # noqa: F401 (closes sockets of disabled tenants)
 import confluent.debugger as debugger
 try:
@@ -416,6 +417,7 @@ async def asyncrun(args):
         return _finish_shutdown()
     disco.start_detection()
     tenantservices.start_all()
+    tenantnetcfg.start_all()
     await asyncio.sleep(1)
     await consoleserver.start_console_sessions()
 

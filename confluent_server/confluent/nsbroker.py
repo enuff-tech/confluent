@@ -296,6 +296,46 @@ def _interface_ipv4(probe, name):
     return ['%s/%d' % (addr, ipaddress.IPv4Network('0.0.0.0/' + mask).prefixlen)]
 
 
+def _ipv4_addresses():
+    """Every IPv4 address of this namespace by interface index (the
+    ioctls above only tell the first of each interface), read with an
+    RTM_GETADDR dump on a netlink socket that is never handed out."""
+    found = {}
+    nl = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, socket.NETLINK_ROUTE)
+    try:
+        nl.bind((0, 0))
+        nl.settimeout(2)
+        nl.send(struct.pack('IHHII', 24, 22, 0x301, 1, 0) +
+                struct.pack('BBBBI', socket.AF_INET, 0, 0, 0, 0))
+        while True:
+            data = nl.recv(65536)
+            while len(data) >= 16:
+                length, kind = struct.unpack('IH', data[:6])
+                if length < 16 or kind in (2, 3):  # NLMSG_ERROR, NLMSG_DONE
+                    return found
+                if kind == 20 and length >= 24:  # RTM_NEWADDR
+                    family, plen, _, _, index = struct.unpack('BBBBI', data[16:24])
+                    rta, local, address = data[24:length], None, None
+                    while len(rta) >= 4:
+                        rtalen, rtatype = struct.unpack('HH', rta[:4])
+                        if rtalen < 4:
+                            break
+                        if rtatype == 2:
+                            local = rta[4:rtalen]
+                        elif rtatype == 1:
+                            address = rta[4:rtalen]
+                        rta = rta[(rtalen + 3) & ~3:]
+                    value = local or address
+                    if family == socket.AF_INET and value and len(value) == 4:
+                        found.setdefault(index, []).append(
+                            '%s/%d' % (socket.inet_ntoa(value), plen))
+                data = data[(length + 3) & ~3:]
+    except OSError:
+        return None
+    finally:
+        nl.close()
+
+
 def op_list_interfaces(ctx, args):
     """Links of this namespace. /proc/self/net and the interface ioctls are
     namespace-aware; /sys is not used, as it may show the host."""
@@ -310,6 +350,7 @@ def op_list_interfaces(ctx, args):
     except OSError:
         pass
     found = []
+    ipv4 = _ipv4_addresses()
     probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         for index, name in socket.if_nameindex():
@@ -320,7 +361,9 @@ def op_list_interfaces(ctx, args):
             except OSError:
                 mac = None
             found.append({'name': name, 'index': index, 'up': bool(flags & 1),
-                          'mac': mac, 'ipv4': _interface_ipv4(probe, name),
+                          'mac': mac,
+                          'ipv4': (_interface_ipv4(probe, name) if ipv4 is None
+                                   else ipv4.get(index, [])),
                           'ipv6': ipv6.get(name, [])})
     finally:
         probe.close()
@@ -451,7 +494,7 @@ def handle_request(ctx, data):
             raise RpcError('EPROTO', 'unsupported protocol version')
         if not isinstance(msgid, int) or isinstance(msgid, bool):
             raise RpcError('EINVAL', 'id must be an integer')
-        op = OPS.get(req.get('op'))
+        op = ctx.get('ops', OPS).get(req.get('op'))
         if op is None:
             raise RpcError('EOPNOTSUPP', 'unknown operation')
         if not ctx['limiter'].allow():
@@ -493,15 +536,21 @@ def _resolve_uids(uids, users):
     return allowed
 
 
-def main(argv=None):
-    parser = argparse.ArgumentParser(description='confluent per-tenant network broker')
+def main(argv=None, ops=None, name='nsbroker',
+         description='confluent per-tenant network broker', arguments=None,
+         prepare=None):
+    """Serve the operations of this broker; or, for the helper built on
+    the same serving loop (nsnetcfg), the closed set it passes as ops."""
+    parser = argparse.ArgumentParser(description=description)
     parser.add_argument('--tenant', required=True)
     parser.add_argument('--socket', required=True)
     parser.add_argument('--allow-uid', type=int, action='append', default=[])
     parser.add_argument('--allow-user', action='append', default=[])
+    if arguments is not None:
+        arguments(parser)
     args = parser.parse_args(argv)
     logging.basicConfig(stream=sys.stderr, level=logging.INFO,
-                        format='nsbroker[%(process)d] %(message)s')
+                        format=name + '[%(process)d] %(message)s')
     if os.getuid() == 0:
         log.error('refusing to run as root')
         return 2
@@ -510,7 +559,10 @@ def main(argv=None):
         log.error('no allowed peers given')
         return 2
     ctx = {'tenant': args.tenant, 'limiter': RateLimiter(),
-           'clients': threading.BoundedSemaphore(MAX_CLIENTS)}
+           'clients': threading.BoundedSemaphore(MAX_CLIENTS),
+           'ops': OPS if ops is None else ops}
+    if prepare is not None:
+        prepare(ctx, args)
     try:
         os.unlink(args.socket)
     except FileNotFoundError:

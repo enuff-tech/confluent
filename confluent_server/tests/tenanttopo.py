@@ -34,6 +34,7 @@ import tempfile
 import time
 
 import confluent.nsbroker as nsbroker
+import confluent.nsnetcfg as nsnetcfg
 import confluent.tenantnet as tenantnet
 
 HW_IP = '10.241.34.2'
@@ -43,6 +44,7 @@ HW_MAC = '02:00:00:aa:34:02'
 TENANTS = {'t00000000000a': ('t1-hw', 61), 't00000000000b': ('t2-hw', 62)}
 BROKER_UID = 65534   # nobody
 CLIENT_UID = 65533   # an unprivileged service account
+NETCFG_UID = 65532   # the network configuration helper's account
 BMC_USER = 'admin'
 BMC_PASSWORD = 'same-in-every-tenant'
 SERVER_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -394,6 +396,13 @@ class Topology(object):
         self.broker_py = os.path.join(self.dir, 'broker.py')
         shutil.copy(nsbroker.__file__, self.broker_py)
         os.chmod(self.broker_py, 0o644)
+        # the configuration helper is run from next to the broker
+        self.netcfg_py = os.path.join(self.dir, 'nsnetcfg.py')
+        shutil.copy(nsnetcfg.__file__, self.netcfg_py)
+        os.chmod(self.netcfg_py, 0o644)
+        shutil.copy(nsbroker.__file__, os.path.join(self.dir, 'nsbroker.py'))
+        os.chmod(os.path.join(self.dir, 'nsbroker.py'), 0o644)
+        self.helpers = {}
         self.ns = {}
         self.lan = {}
         self.brokers = {}
@@ -503,6 +512,43 @@ class Topology(object):
         wait(lambda: os.path.exists(path))
         self.brokers[tid] = proc
         return proc
+
+    def netcfg_socket(self, tid):
+        return os.path.join(self.dir, tid, 'netcfg.sock')
+
+    def resolv_conf(self, tid):
+        return os.path.join('/etc/netns', self.ns[tid], 'resolv.conf')
+
+    def start_netcfg(self, tid, ns=None, uid=NETCFG_UID, caps='-all,+net_admin'):
+        """The tenant's network configuration helper, as its unit runs it:
+        in the tenant's namespace, unprivileged, with CAP_NET_ADMIN only."""
+        path = self.netcfg_socket(tid)
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+        resolv = self.resolv_conf(tid)
+        with open(resolv, 'w'):
+            pass
+        os.chown(resolv, uid, uid)
+        proc = self.netns.spawn(
+            ns or self.ns[tid], 'setpriv', '--reuid=%d' % uid, '--regid=%d' % uid,
+            '--clear-groups', '--inh-caps=' + caps, '--ambient-caps=' + caps,
+            '--bounding-set=' + caps, '--no-new-privs', sys.executable, '-I',
+            self.netcfg_py, '--tenant', tid, '--socket', path, '--resolv', resolv,
+            '--allow-uid', '0', '--allow-uid', str(CLIENT_UID))
+        wait(lambda: os.path.exists(path))
+        self.helpers[tid] = proc
+        return proc
+
+    def stop_netcfg(self, tid):
+        proc = self.helpers.pop(tid)
+        proc.kill()
+        proc.wait()
+
+    def netcfg(self, tid, uid=NETCFG_UID):
+        return tenantnet.register_netcfg(tid, self.netcfg_socket(tid), uid,
+                                         os.path.join('/run/netns', self.ns[tid]))
 
     def stop_broker(self, tid):
         proc = self.brokers.pop(tid)

@@ -576,6 +576,51 @@ def network_for(tenantid):
         return net
 
 
+_netcfgs = {}
+
+
+def netcfg_user(tenantid):
+    return 'cfnet-' + tenantid
+
+
+def netcfg_socket(tenantid):
+    return os.path.join(RUN_DIR, tenantid, 'netcfg', 'netcfg.sock')
+
+
+def netcfg_for(tenantid):
+    """The connection to a tenant's network configuration helper (a
+    Broker: checked to run as the tenant's helper account, inside the
+    tenant's namespace). It changes the tenant's network and never hands
+    out sockets."""
+    if tenantid is None:
+        raise ValueError('the network of the default tenant is the host\'s own')
+    record = configmanager.get_tenant(tenantid)
+    if record is None or record['state'] != 'active' or not configmanager.multitenancy_enabled():
+        raise TenantNetworkUnavailable(
+            'tenant {0} cannot use its network'.format(tenantid))
+    with _networks_lock:
+        helper = _netcfgs.get(tenantid)
+        if helper is None or helper.closed:
+            try:
+                uid = pwd.getpwnam(netcfg_user(tenantid)).pw_uid
+            except KeyError:
+                raise TenantNetworkUnavailable(
+                    'tenant {0} has no network configuration helper'.format(tenantid))
+            helper = Broker(tenantid, netcfg_socket(tenantid), uid,
+                            os.path.join(NETNS_DIR, netns_name(tenantid)))
+            _netcfgs[tenantid] = helper
+        return helper
+
+
+def register_netcfg(tenantid, sockpath, helper_uid, netns_path):
+    """Use an explicitly given configuration helper for a tenant (tests,
+    non-standard layouts)."""
+    with _networks_lock:
+        helper = Broker(tenantid, sockpath, helper_uid, netns_path)
+        _netcfgs[tenantid] = helper
+        return helper
+
+
 def register_network(tenantid, sockpath, broker_uid, netns_path):
     """Use an explicitly given broker for a tenant (tests, non-standard
     layouts)."""
@@ -588,8 +633,11 @@ def register_network(tenantid, sockpath, broker_uid, netns_path):
 def close_tenant(tenantid):
     with _networks_lock:
         net = _networks.pop(tenantid, None)
+        helper = _netcfgs.pop(tenantid, None)
     if net is not None:
         net.broker.close()
+    if helper is not None:
+        helper.close()
 
 
 def _tenant_state_changed(tenantid, state):
