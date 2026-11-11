@@ -1951,14 +1951,9 @@ def stop_tenant_detection(tenant):
     state = _tenant_listeners.pop(tenant, None)
     if state is None:
         return
-    for task in state['tasks']:
-        task.cancel()
-    recheck = _recheck.for_tenant(tenant).pop('task', None)
-    if recheck is not None:
-        recheck.cancel()
-    scan = _tenant_scan.for_tenant(tenant).pop('scanner', None)
-    if scan is not None:
-        scan.cancel()
+    tasks.cancel_all(state['tasks'] + [
+        _recheck.for_tenant(tenant).pop('task', None),
+        _tenant_scan.for_tenant(tenant).pop('scanner', None)])
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:

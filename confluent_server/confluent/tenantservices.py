@@ -101,12 +101,13 @@ def stop(tenant):
     # before it is closed (or a later socket with the same descriptor
     # would inherit its registration).
     for server in state['servers']:
-        server.close()
-    for task in state['tasks']:
         try:
-            task.cancel()
-        except RuntimeError:  # its event loop is gone
+            server.close()
+        except (OSError, ValueError):
+            # its socket was closed already, with the tenant's network
+            # (which had the event loop let go of it first)
             pass
+    tasks.cancel_all(state['tasks'])
     for sock in state['sockets']:
         try:
             if loop is not None and sock.fileno() != -1:
