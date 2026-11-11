@@ -42,8 +42,40 @@ def _root(tenant, kind):
     return os.path.join(BASE, 'tenants', tenant, kind)
 
 
+def base(tenant):
+    """The directory all of a tenant's deployment trees are under (the
+    whole of /var/lib/confluent for the default tenant)."""
+    if tenant is None:
+        return BASE
+    if not configmanager.valid_tenant_id(tenant):
+        raise ValueError('invalid tenant id')
+    return os.path.join(BASE, 'tenants', tenant)
+
+
 def public_root(tenant):
     return _root(tenant, 'public')
+
+
+def distributions_root(tenant):
+    """Imported OS media, which profiles link to."""
+    return _root(tenant, 'distributions')
+
+
+def media_root(tenant):
+    """Where a tenant's OS media wait to be imported."""
+    return _root(tenant, 'media')
+
+
+# Product content every installation has, the same for all tenants, which
+# profiles link to (boot environments, stock profile parts, boot loaders).
+SHARED_ROOTS = ('/opt/confluent/genesis', '/opt/confluent/lib/osdeploy',
+                '/opt/confluent/lib/ipxe')
+
+
+def content_roots(tenant):
+    """Where a file served as the tenant's public content may really
+    be: its public tree, the media it imported, and product content."""
+    return (distributions_root(tenant),) + SHARED_ROOTS
 
 
 def private_root(tenant):
@@ -78,18 +110,25 @@ def _tenant_state_changed(tenant, state):
 configmanager.watch_tenant_state(_tenant_state_changed)
 
 
-def contained_file(root, relative):
+def contained_file(root, relative, also=()):
     """The real path of a regular file below root, or None.
 
     Nothing outside root is ever returned: not through '..', and not
     through a symbolic link that leaves the tree (so a tenant's tree
-    cannot be made to serve another tenant's files, or the host's).
+    cannot be made to serve another tenant's files, or the host's). A
+    link may lead into one of the trees given as also (see content_roots).
     """
     if '\x00' in relative:
         return None
     realroot = os.path.realpath(root)
     candidate = os.path.realpath(os.path.join(realroot, relative.lstrip('/')))
-    if not candidate.startswith(os.path.join(realroot, '')):
+    # the name asked for is always below root; only where it really is
+    # may be in one of the other trees
+    if not os.path.normpath(os.path.join(realroot, relative.lstrip('/'))).startswith(
+            os.path.join(realroot, '')):
+        return None
+    allowed = [realroot] + [os.path.realpath(other) for other in also]
+    if not any(candidate.startswith(os.path.join(tree, '')) for tree in allowed):
         return None
     if not os.path.isfile(candidate):
         return None

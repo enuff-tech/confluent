@@ -25,7 +25,11 @@ if __name__ == '__main__':
 import confluent.exceptions as exc
 import confluent.messages as msg
 import confluent.tasks as tasks
+import confluent.tenantguard as tenantguard
+import confluent.tenantpaths as tenantpaths
+import confluent.tenantstate as tenantstate
 import confluent.util as util
+import contextvars
 
 COPY = 1
 EXTRACT = 2
@@ -55,6 +59,64 @@ from libarchive.ffi import (
     read_data_block, write_data_block, write_finish_entry, ARCHIVE_EOF
 )
 
+STOCK_BASE = '/var/lib/confluent'
+# Product content profiles are made from and rebased to.
+TEMPLATE_ROOT = '/opt/confluent/lib/osdeploy'
+_image_base = contextvars.ContextVar('image_base', default=None)
+
+
+def image_base():
+    """The tree images and profiles are worked on in: the tenant's own
+    for work done for a tenant, /var/lib/confluent otherwise. A worker
+    process is told by its environment, a task started by host_task by
+    its context."""
+    chosen = _image_base.get() or os.environ.get('CONFLUENT_IMAGE_BASE')
+    if chosen:
+        return chosen
+    return tenantpaths.base(tenantguard.current_tenant.get())
+
+
+def _p(path):
+    """A path as the default tenant's code spells it, in the tree being
+    worked on."""
+    return image_base() + path[len(STOCK_BASE):]
+
+
+def host_task(coro):
+    """Start coro as a task of the service itself, working on the tree
+    of whoever asks.
+
+    Importing media and building boot files run tools on the host; a
+    task working for a tenant may not start processes (nor is there a
+    reason for these to use any network). What they act on stays the
+    tree of the tenant that asked.
+    """
+    chosen = image_base()
+
+    async def run():
+        _image_base.set(chosen)
+        return await coro
+    return contextvars.Context().run(asyncio.ensure_future, run())
+
+
+def safe_name(name):
+    """A profile or distribution name that is one path component."""
+    if (not isinstance(name, str) or not name or name in ('.', '..')
+            or '/' in name or '\x00' in name):
+        raise exc.InvalidArgumentException('Invalid name')
+    return name
+
+
+def tenant_media(tenant, name):
+    """The media file a tenant names for import: one of the files in its
+    own media directory, never a path of the host."""
+    found = tenantpaths.contained_file(tenantpaths.media_root(tenant), safe_name(name))
+    if found is None:
+        raise exc.InvalidArgumentException(
+            'No such media: {0}'.format(name))
+    return found
+
+
 def relax_umask():
     os.umask(0o22)
 
@@ -75,10 +137,10 @@ def symlink(src, targ):
 
 
 async def update_boot(profilename, initialimport=False):
-    if profilename.startswith('/var/lib/confluent/public'):
+    if profilename.startswith(_p('/var/lib/confluent/public')):
         profiledir = profilename
     else:
-        profiledir = '/var/lib/confluent/public/os/{0}'.format(profilename)
+        profiledir = _p('/var/lib/confluent/public/os/{0}').format(profilename)
     profile = {}
     if profiledir.endswith('/'):
         profiledir = profiledir[:-1]
@@ -155,7 +217,7 @@ async def update_boot_esxi(profiledir, profile, label):
         bcfg.write(newbootcfg)
     finally:
         bcfg.close()
-    symlink('/var/lib/confluent/public/site/initramfs.tgz',
+    symlink(_p('/var/lib/confluent/public/site/initramfs.tgz'),
                '{0}/boot/site.tgz'.format(profiledir))
     for fn in filesneeded:
         if fn.startswith('/'):
@@ -1036,7 +1098,7 @@ async def extract_tar(archive, profilename, origprofilename, callback):
         'private/os/{0}'.format(origprofilename),
     ))
     proc = await asyncio.create_subprocess_exec(
-        *args, cwd='/var/lib/confluent',
+        *args, cwd=_p('/var/lib/confluent'),
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.PIPE)
@@ -1084,11 +1146,11 @@ async def import_image(filename, callback, backend=False, mfd=None, custtargpath
     distpath = custdistpath
     if distpath is None:
         targpath = identity['name']
-        distpath = '/var/lib/confluent/distributions/' + targpath
+        distpath = _p('/var/lib/confluent/distributions/') + targpath
     if custtargpath is None:
         if identity.get('subname', None):
             targpath += '/' + identity['subname']
-        targpath = '/var/lib/confluent/distributions/' + targpath
+        targpath = _p('/var/lib/confluent/distributions/') + targpath
     else:
         targpath = custtargpath
     if targpath:
@@ -1151,22 +1213,23 @@ def printit(info):
 
 def list_distros():
     try:
-        return sorted(os.listdir('/var/lib/confluent/distributions'))
+        return sorted(os.listdir(_p('/var/lib/confluent/distributions')))
     except FileNotFoundError:
         return []
 
 def list_profiles():
     try:
-        return sorted(os.listdir('/var/lib/confluent/public/os/'))
+        return sorted(os.listdir(_p('/var/lib/confluent/public/os/')))
     except FileNotFoundError:
         return []
 
 def get_profile_label(profile):
-    with open('/var/lib/confluent/public/os/{0}/profile.yaml') as metadata:
+    with open(_p('/var/lib/confluent/public/os/{0}/profile.yaml')) as metadata:
         prof = yaml.safe_load(metadata)
     return prof.get('label', profile)
 
-importing = {}
+# imports in progress, of each tenant
+importing = tenantstate.TenantScoped()
 
 
 class ManifestMissing(Exception):
@@ -1191,10 +1254,10 @@ async def get_hash(fname):
 
 
 async def rebase_profile(dirname):
-    if dirname.startswith('/var/lib/confluent/public'):
+    if dirname.startswith(_p('/var/lib/confluent/public')):
         profiledir = dirname
     else:
-        profiledir = '/var/lib/confluent/public/os/{0}'.format(dirname)
+        profiledir = _p('/var/lib/confluent/public/os/{0}').format(dirname)
     festfile = os.path.join(profiledir, 'manifest.yaml')
     try:
         with open(festfile, 'r') as festfile:
@@ -1202,6 +1265,15 @@ async def rebase_profile(dirname):
     except IOError:
         raise ManifestMissing()
     distdir = manifest['distdir']
+    if image_base() != STOCK_BASE:
+        # The manifest is part of the tenant's tree. Files are copied from
+        # the directory it names into what is served to the tenant's
+        # nodes: only ever from the product's own profile content.
+        realdist = os.path.realpath(str(distdir))
+        if not realdist.startswith(os.path.join(os.path.realpath(TEMPLATE_ROOT), '')):
+            raise exc.InvalidArgumentException(
+                'The profile was not made from packaged content and cannot be rebased')
+        distdir = realdist
     currhashes = await get_hashes(profiledir, distdir)
     newdisthashes = await get_hashes(distdir)
     olddisthashes = manifest['disthashes']
@@ -1277,7 +1349,7 @@ async def generate_stock_profiles(defprofile, distpath, targpath, osname,
             profname = '{0}-{1}'.format(customname, prof)
         else:
             profname = '{0}-{1}'.format(osname, prof)
-        dirname = '/var/lib/confluent/public/os/{0}'.format(profname)
+        dirname = _p('/var/lib/confluent/public/os/{0}').format(profname)
         if os.path.exists(dirname):
             continue
         oumask = os.umask(0o22)
@@ -1318,7 +1390,7 @@ async def generate_stock_profiles(defprofile, distpath, targpath, osname,
             os.symlink(fullpath,
                        '{0}/boot/initramfs/{1}'.format(dirname, initrd))
         os.symlink(
-            '/var/lib/confluent/public/site/initramfs.cpio',
+            _p('/var/lib/confluent/public/site/initramfs.cpio'),
             '{0}/boot/initramfs/site.cpio'.format(dirname))
         os.symlink(distpath, '{0}/distribution'.format(dirname))
         await util.check_call(
@@ -1334,12 +1406,16 @@ class MediaImporter(object):
 
     async def init(self, media, cfm=None, customname=None, checkonly=False):
         self.worker = None
-        if not os.path.exists('/var/lib/confluent/public'):
+        if not os.path.exists(_p('/var/lib/confluent/public')):
             raise Exception('`osdeploy initialize` must be executed before importing any media')
         self.profiles = []
         self.errors = []
         medfile = None
         self.medfile = None
+        self.base = image_base()
+        if cfm is not None and cfm.tenant is not None:
+            # a tenant names one of the files in its media directory
+            media = tenant_media(cfm.tenant, media)
         if cfm and media in cfm.clientfiles:
             self.medfile = cfm.clientfiles[media]
             medfile = self.medfile
@@ -1357,6 +1433,13 @@ class MediaImporter(object):
         self.phase = 'copying'
         if not identity:
             raise Exception('Unrecognized OS Media')
+        if customname:
+            safe_name(customname)
+        if cfm is not None and cfm.tenant is not None and not identity.get('distribution', True):
+            # Ready-made profiles bring their own scripts and manifests,
+            # which the service would act on: not from a tenant.
+            raise exc.InvalidArgumentException(
+                'Only OS installation media can be imported within a tenant')
         self.customname = customname if customname else ''
         if customname:
             importkey = customname
@@ -1378,14 +1461,14 @@ class MediaImporter(object):
         self.targets = []
         targpaths = []
         if identity.get('distribution', True):
-            self.distpath = '/var/lib/confluent/distributions/' + targpath
+            self.distpath = _p('/var/lib/confluent/distributions/') + targpath
             if identity.get('subname', None):  # subname is to indicate disk number in a media set
                 targpath += '/' + identity['subname']
-            self.targpath = '/var/lib/confluent/distributions/' + targpath
+            self.targpath = _p('/var/lib/confluent/distributions/') + targpath
             targpaths = [self.targpath]
             self.targets = targpaths
         else:
-            targpaths = [f'/var/lib/confluent/public/os/{targpath}', f'/var/lib/confluent/private/os/{targpath}']
+            targpaths = [_p(f'/var/lib/confluent/public/os/{targpath}'), _p(f'/var/lib/confluent/private/os/{targpath}')]
             self.targets = targpaths
         for targ in targpaths:
             if os.path.exists(targ):
@@ -1399,7 +1482,7 @@ class MediaImporter(object):
         importing[importkey] = self
         self.filename = os.path.abspath(media)
         self.error = ''
-        self.importer = tasks.spawn_task(self.importmedia())
+        self.importer = host_task(self.importmedia())
 
     def stop(self):
         if self.worker and self.worker.returncode is None:
@@ -1415,7 +1498,8 @@ class MediaImporter(object):
         self.worker = await asyncio.create_subprocess_exec(
             sys.executable, __file__, self.filename, '-b',
             self.targpath, self.distpath, self.customname,
-            stdout=asyncio.subprocess.PIPE, close_fds=False)
+            stdout=asyncio.subprocess.PIPE, close_fds=False,
+            env=dict(os.environ, CONFLUENT_IMAGE_BASE=self.base))
         wkr = self.worker
         currline = b''
         while wkr.returncode is None:
@@ -1460,8 +1544,7 @@ class MediaImporter(object):
                 currline = b''
             a = await wkr.stdout.read(1)
         if self.oscategory:
-            defprofile = '/opt/confluent/lib/osdeploy/{0}'.format(
-                self.oscategory)
+            defprofile = '{0}/{1}'.format(TEMPLATE_ROOT, self.oscategory)
             try:
                 await generate_stock_profiles(defprofile, self.distpath, self.targpath,
                                         self.osname, self.profiles, self.customname)

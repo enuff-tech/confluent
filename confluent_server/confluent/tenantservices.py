@@ -47,6 +47,7 @@ import confluent.tasks as tasks
 import confluent.tenantca as tenantca
 import confluent.tenantnet as tenantnet
 import confluent.tenantpaths as tenantpaths
+import confluent.tenantsite as tenantsite
 
 HTTPS_PORT = 443
 HTTP_PORT = 80
@@ -166,7 +167,8 @@ async def _content(tenant, request, relative):
     if relative == 'site/confluent_uuid':
         return web.Response(
             text=configmanager.ConfigManager(tenant).service_uuid() + '\n')
-    found = tenantpaths.contained_file(tenantpaths.public_root(tenant), relative)
+    found = tenantpaths.contained_file(tenantpaths.public_root(tenant), relative,
+                                       also=tenantpaths.content_roots(tenant))
     if found is None:
         return web.Response(status=404, text='Not Found')
     return web.FileResponse(found)
@@ -283,6 +285,12 @@ async def _serve(tenant, state):
                 if not addr.is_loopback:
                     names.add(str(addr))
     context = await tenantca.server_context(tenant, names or {'localhost'})
+    try:
+        # what its nodes are given to trust, and its boot loaders
+        await tenantsite.ensure(tenant)
+    except OSError as e:
+        log.service_log({'error': 'The deployment tree of tenant {0} could not be '
+                                  'prepared: {1}'.format(tenant, e)})
     app = web.Application()
     app.router.add_route('*', '/{path_info:.*}', _handler(tenant))
     runner = web.AppRunner(app, access_log=None)
