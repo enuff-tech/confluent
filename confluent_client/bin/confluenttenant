@@ -1,0 +1,138 @@
+#!/usr/bin/python3
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
+
+# Copyright 2026 Lenovo
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Manage the tenants of a multi-tenant confluent service.
+
+For platform administrators: local root, or a user with the PlatformAdmin
+role. Tenant infrastructure is managed by each tenant's own administrator
+with the usual commands, logged in as <tenant>/<user>.
+"""
+
+import optparse
+import os
+import signal
+import sys
+
+try:
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+except AttributeError:
+    pass
+
+path = os.path.dirname(os.path.realpath(__file__))
+path = os.path.realpath(os.path.join(path, '..', 'lib', 'python'))
+if path.startswith('/opt'):
+    sys.path.append(path)
+
+import confluent.client as client
+
+USAGE = '''%prog list
+       %prog show <tenant>
+       %prog create <name>
+       %prog enable|disable <tenant>
+       %prog delete [-y] <tenant>
+       %prog enroll <tenant>
+       %prog multitenancy [on|off]'''
+
+argparser = optparse.OptionParser(usage=USAGE)
+argparser.add_option('-y', '--yes', action='store_true',
+                     help='Do not ask for confirmation when deleting')
+(options, args) = argparser.parse_args()
+
+
+def results(responses):
+    """Collect the responses of a request, exiting on an error."""
+    collected = []
+    for rsp in responses:
+        if 'error' in rsp or 'errorcode' in rsp:
+            sys.exit(client.printerror(rsp) or 1)
+        collected.append(rsp)
+    return collected
+
+
+def show_record(record):
+    for key in sorted(record):
+        print('{0}: {1}'.format(key, record[key]))
+
+
+def show_enrollment(record):
+    print('Enrollment token for tenant "{0}" (shown once, valid until {1}):'.format(
+        record.get('name', record.get('id')), record['enrollment_expires']))
+    print(record['enrollment_token'])
+    print('The tenant administrator redeems it with a POST to /tenantenrollment '
+          'giving tenant, token, username and password.')
+
+
+def main():
+    if not args:
+        argparser.print_help()
+        return 1
+    command, rest = args[0], args[1:]
+    session = client.Command()
+    if command == 'list' and not rest:
+        for rsp in results(session.read('/tenants/')):
+            tenantid = rsp['item']['href'].rstrip('/')
+            for record in results(session.read('/tenants/' + tenantid)):
+                print('{0}  {1:<8}  {2}'.format(record['id'], record['state'],
+                                                 record['name']))
+        return 0
+    if command == 'show' and len(rest) == 1:
+        for record in results(session.read('/tenants/' + rest[0])):
+            show_record(record)
+        return 0
+    if command == 'create' and len(rest) == 1:
+        for record in results(session.create('/tenants/', {'name': rest[0]})):
+            print('Created tenant "{0}" with id {1}'.format(record['name'], record['id']))
+            show_enrollment(record)
+        return 0
+    if command in ('enable', 'disable') and len(rest) == 1:
+        state = 'active' if command == 'enable' else 'disabled'
+        for record in results(session.update('/tenants/' + rest[0], {'state': state})):
+            print('{0}: {1}'.format(record['name'], record['state']))
+        return 0
+    if command == 'delete' and len(rest) == 1:
+        name = results(session.read('/tenants/' + rest[0]))[0]['name']
+        if not options.yes:
+            answer = input('Delete tenant "{0}" and all of its configuration? '
+                           'Type its name to confirm: '.format(name))
+            if answer != name:
+                print('Not deleted')
+                return 1
+        results(session.delete('/tenants/' + rest[0], {'confirm': name}))
+        print('Deleted tenant "{0}"'.format(name))
+        return 0
+    if command == 'enroll' and len(rest) == 1:
+        for record in results(session.create('/tenants/{0}/enrollment'.format(rest[0]))):
+            show_enrollment(record)
+        return 0
+    if command == 'multitenancy' and len(rest) <= 1:
+        if rest and rest[0] not in ('on', 'off'):
+            argparser.print_help()
+            return 1
+        if rest:
+            responses = session.update('/platform/multitenancy',
+                                       {'enabled': rest[0] == 'on'})
+        else:
+            responses = session.read('/platform/multitenancy')
+        for record in results(responses):
+            show_record(record)
+        return 0
+    argparser.print_help()
+    return 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())

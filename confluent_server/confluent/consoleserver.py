@@ -622,6 +622,10 @@ def _nodechange(added, deleting, renamed, configmanager):
 
 
 async def _start_tenant_sessions(cfm):
+    if cfm.tenant is not None:
+        # Console connections are made from the host's network; tenant
+        # consoles wait until they can be made within the tenant's own.
+        return
     nodeattrs = cfm.get_node_attributes(cfm.list_nodes(), 'collective.manager')
     for node in nodeattrs:
         manager = nodeattrs[node].get('collective.manager', {}).get('value',

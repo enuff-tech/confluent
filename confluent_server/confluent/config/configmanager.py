@@ -136,7 +136,10 @@ _attraliases = {
     'bmcpass': 'secret.hardwaremanagementpassword',
     'switchpass': 'secret.hardwaremanagementpassword',
 }
-_validroles = ['Administrator', 'Operator', 'Monitor', 'Stub']
+_validroles = ['Administrator', 'Operator', 'Monitor', 'Stub', 'PlatformAdmin']
+# Manages tenants and the service, never infrastructure; only valid for
+# users of the main store (see auth.authorize).
+PLATFORM_ROLE = 'PlatformAdmin'
 
 membership_callback = None
 
@@ -833,6 +836,87 @@ def _true_set_tenant_state(tenantid, state):
     ConfigManager._bg_sync_to_file()
 
 
+# Service-wide tenancy settings: unlike other globals, these must be the
+# same on every collective member, so they are replicated and sent to
+# joining members.
+_tenancy_globals = ('multitenancy.enabled', 'tenancy.schema')
+
+
+async def set_multitenancy_enabled(enabled):
+    enabled = bool(enabled)
+    if cfgleader:
+        return await exec_on_leader('_rpc_master_set_multitenancy_enabled', enabled)
+    if cfgstreams:
+        await exec_on_followers('_rpc_set_multitenancy_enabled', enabled)
+    set_global('multitenancy.enabled', enabled)
+
+
+async def _rpc_master_set_multitenancy_enabled(enabled):
+    await set_multitenancy_enabled(enabled)
+
+
+def _rpc_set_multitenancy_enabled(enabled):
+    set_global('multitenancy.enabled', bool(enabled))
+
+
+async def set_tenant_enrollment(tenantid, tokenhash, expires):
+    """Record the hash and expiry of a tenant's one-time enrollment token."""
+    if get_tenant(tenantid) is None:
+        raise exc.NotFoundException('No such tenant')
+    if cfgleader:
+        return await exec_on_leader('_rpc_master_set_tenant_enrollment',
+                                    tenantid, tokenhash, expires)
+    if cfgstreams:
+        await exec_on_followers('_rpc_set_tenant_enrollment', tenantid,
+                                tokenhash, expires)
+    _true_set_tenant_enrollment(tenantid, tokenhash, expires)
+
+
+async def _rpc_master_set_tenant_enrollment(tenantid, tokenhash, expires):
+    await set_tenant_enrollment(tenantid, tokenhash, expires)
+
+
+def _rpc_set_tenant_enrollment(tenantid, tokenhash, expires):
+    _true_set_tenant_enrollment(tenantid, tokenhash, expires)
+
+
+def _true_set_tenant_enrollment(tenantid, tokenhash, expires):
+    meta = _cfgstore['tenant'][tenantid]['meta']
+    if tokenhash is None:
+        meta.pop('enrollment', None)
+    else:
+        meta['enrollment'] = {'hash': tokenhash, 'expires': expires}
+    _mark_dirtykey('meta', 'enrollment', tenantid)
+    ConfigManager._bg_sync_to_file()
+
+
+async def consume_tenant_enrollment(tenantid, tokenhash):
+    """Use up a tenant's enrollment token if this is its hash.
+
+    Returns True exactly once per issued token, also when several members
+    of a collective are asked at the same time: the leader checks and
+    clears it without yielding in between.
+    """
+    if cfgleader:
+        return await exec_on_leader('_rpc_master_consume_tenant_enrollment',
+                                    tenantid, tokenhash)
+    meta = _cfgstore.get('tenant', {}).get(tenantid, {}).get('meta', {})
+    enrollment = meta.get('enrollment')
+    if not enrollment or enrollment['expires'] <= time.time():
+        return False
+    if not hmac_mod.compare_digest(enrollment['hash'], tokenhash):
+        return False
+    _true_set_tenant_enrollment(tenantid, None, None)
+    if cfgstreams:
+        await exec_on_followers('_rpc_set_tenant_enrollment', tenantid,
+                                None, None)
+    return True
+
+
+async def _rpc_master_consume_tenant_enrollment(tenantid, tokenhash):
+    return await consume_tenant_enrollment(tenantid, tokenhash)
+
+
 async def delete_tenant(tenantid):
     """Remove a tenant and all of its configuration.
 
@@ -968,12 +1052,16 @@ async def dump_collective_payload():
             'data': json.loads(await ConfigManager(tenantid)._dump_to_json())}
     if tenants:
         data['_tenants'] = tenants
+    data['_tenancy'] = dict((g, get_global(g)) for g in _tenancy_globals)
     return json.dumps(data, sort_keys=True).encode('utf8')
 
 
 async def load_collective_tenants(jsondata):
     """Install the tenants of a dump_collective_payload() payload."""
     data = json.loads(jsondata)
+    for name, value in data.get('_tenancy', {}).items():
+        if name in _tenancy_globals:
+            set_global(name, value, sync=False)
     for tenantid in sorted(data.get('_tenants', {})):
         entry = data['_tenants'][tenantid]
         _install_tenant_record(tenantid, entry['record'])
@@ -1344,6 +1432,10 @@ def commit_clear():
     for globvar in _oldcfgstore.get('globals', ()):
         if globvar.endswith('_key') or globvar == 'confluent_uuid':
             continue
+        if globvar in _tenancy_globals and globvar in _cfgstore.get('globals', {}):
+            continue  # the collective's value, received with the configuration
+        if 'globals' not in _cfgstore:
+            _cfgstore['globals'] = {}
         _cfgstore['globals'][globvar] = _oldcfgstore['globals'][globvar]
     _oldcfgstore = None
     _oldtxcount = 0
@@ -1896,6 +1988,11 @@ class ConfigManager(object):
         self._cfgstore.setdefault('globals', {})[globalname] = value
         _mark_dirtykey('globals', globalname, self.tenant)
 
+    def _check_role_scope(self, role):
+        if role == PLATFORM_ROLE and self.tenant is not None:
+            raise ValueError('The {0} role is not available inside a '
+                             'tenant'.format(PLATFORM_ROLE))
+
     def _cryptkey(self):
         """The key secrets of this tenant are encrypted with.
 
@@ -2164,6 +2261,7 @@ class ConfigManager(object):
                     raise ValueError(
                         'Unrecognized role "{0}" (valid roles: {1})'.format(attributemap[attribute], ','.join(_validroles)))
                 attributemap[attribute] = therole
+                self._check_role_scope(therole)
             self._cfgstore['usergroups'][groupname][attribute] = attributemap[attribute]
         _mark_dirtykey('usergroups', groupname, self.tenant)
         self._bg_sync_to_file()
@@ -2200,6 +2298,7 @@ class ConfigManager(object):
             raise ValueError(
                 'Unrecognized role "{0}" (valid roles: {1})'.format(
                     role, ','.join(_validroles)))
+        self._check_role_scope(role)
         self._cfgstore['usergroups'][groupname] = {'role': role}
         _mark_dirtykey('usergroups', groupname, self.tenant)
         self._bg_sync_to_file()
@@ -2242,6 +2341,7 @@ class ConfigManager(object):
                     raise ValueError(
                         'Unrecognized role "{0}" (valid roles: {1})'.format(attributemap[attribute], ','.join(_validroles)))
                 attributemap[attribute] = therole
+                self._check_role_scope(therole)
             if attribute == 'password':
                 salt = os.urandom(8)
                 #TODO: WORKERPOOL, offload password set to a worker
@@ -2319,6 +2419,7 @@ class ConfigManager(object):
             raise ValueError(
                 'Unrecognized role "{0}" (valid roles: {1})'.format(
                     role, ','.join(_validroles)))
+        self._check_role_scope(role)
         self._cfgstore['users'][name] = {'id': uid, 'role': role}
         if displayname is not None:
             self._cfgstore['users'][name]['displayname'] = displayname
