@@ -195,11 +195,25 @@ def answer(kind, deadline):
                 'bootfile': data[108:236].rstrip(bytes(1)).decode()}
     return None
 discover = opt(53, bytes([1]))
-if mode == 'pxe':
-    discover += opt(60, b'PXEClient:Arch:00007:UNDI:003016') + opt(93, bytes([0, 7]))
-    discover += opt(97, bytes(1) + bytes.fromhex(uuidhex))
-send(discover)
+identity = b''
+if mode in ('pxe', 'ipxe'):
+    identity = opt(60, b'PXEClient:Arch:00007:UNDI:003016') + opt(93, bytes([0, 7]))
+elif mode == 'httpboot':
+    identity = opt(60, b'HTTPClient:Arch:00016:UNDI:003001') + opt(93, bytes([0, 16]))
+if identity:
+    identity += opt(97, bytes(1) + bytes.fromhex(uuidhex))
+if mode == 'ipxe':
+    identity += opt(77, b'iPXE')
+send(discover + identity)
 result = {'offer': answer(2, time.time() + float(patience)), 'ack': None}
+if result['offer'] and mode == 'ipxe':
+    # as a PXE client does next: ask the boot server (proxyDHCP) for the
+    # boot file, from the address of this interface
+    pkt = struct.pack('!BBBB4sHH', 1, 1, 6, 0, xid, 0, 0) + bytes(16)
+    pkt += chaddr + bytes(10) + bytes(192) + bytes([99, 130, 83, 99])
+    pkt += opt(53, bytes([3])) + identity + bytes([255])
+    s.sendto(pkt, (result['offer']['server'], 4011))
+    result['proxy'] = answer(5, time.time() + float(patience))
 if result['offer'] and mode == 'plain':
     request = opt(53, bytes([3])) + opt(50, socket.inet_aton(result['offer']['yiaddr']))
     request += opt(54, socket.inet_aton(result['offer']['server']))

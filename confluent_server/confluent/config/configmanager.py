@@ -2080,6 +2080,19 @@ class ConfigManager(object):
             return None
         return _unwrap_tenant_key(self.tenant, wrapped)
 
+    def service_uuid(self):
+        """The identity of the service as this tenant's nodes know it.
+
+        The default tenant's is the service's own (the confluent_uuid
+        global). Each other tenant sees one of its own, the same on every
+        collective member, so nodes of different tenants cannot tell that
+        they are served by the same installation.
+        """
+        if self.tenant is None:
+            return get_global('confluent_uuid')
+        import uuid
+        return str(uuid.UUID(bytes=self.derive_secret(b'confluent-uuid')[:16], version=4))
+
     def derive_secret(self, purpose):
         """A secret for one purpose (bytes naming it), derived from the
         key this tenant's secrets are encrypted with."""

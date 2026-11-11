@@ -160,7 +160,7 @@ async def listeners(tenancy):
         _create(tid)
         await _nodes(tid)
         app = web.Application()
-        app.router.add_route('*', '/{path_info:.*}', services._handler(tid))
+        app.router.add_route('*', '/{path_info:.*}', services._handler(tid, tls_only=False))
         clients[tid] = TestClient(TestServer(app))
         await clients[tid].start_server()
     yield clients
@@ -202,10 +202,9 @@ async def test_only_node_paths_are_served(listeners):
                  '/sessions/current/info', '/tenants/', '/selfish'):
         rsp = await listeners[A].get(path, headers=_headers(A))
         assert rsp.status == 404, path
-    # deployment content and remote configuration are not served yet
-    for path in ('/self/deploycfg', '/self/sshcert', '/self/tlscert',
-                 '/self/remoteconfig/post', '/self/remotesyncfiles',
-                 '/self/scriptlist/post', '/self/profileprivate/pending/x'):
+    # SSH certificates and remote configuration are not served yet
+    for path in ('/self/sshcert', '/self/remoteconfig/post', '/self/remotesyncfiles',
+                 '/self/remoteconfigbmc', '/self/register_discovered'):
         rsp = await listeners[A].post('/confluent-api' + path, headers=_headers(A), data=b'x')
         assert rsp.status == 501, path
         # (and say nothing to a node that is not authenticated)

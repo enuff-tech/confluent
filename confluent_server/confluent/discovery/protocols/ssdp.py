@@ -206,10 +206,13 @@ async def _handle_confluent_search(value, s, peer, uuidlookup, cloop):
     except Exception:
         return
     forcereply = False
+    # the tenant whose network the search was heard in (its listener's)
+    net = netcontext.current_network.get()
+    tenant = None if net is None else net.tenant
     for query in value.split('/'):
         node = None
         if query.startswith('confluentuuid='):
-            myuuid = cfm.get_global('confluent_uuid')
+            myuuid = cfm.ConfigManager(tenant).service_uuid()
             curruuid = query.split('=', 1)[1].lower()
             if curruuid != myuuid:
                 break
@@ -230,7 +233,7 @@ async def _handle_confluent_search(value, s, peer, uuidlookup, cloop):
             currmac = query.split('=', 1)[1].lower()
             node = uuidlookup(currmac)
         if node:
-            cfg = cfm.ConfigManager(None)
+            cfg = cfm.ConfigManager(tenant)
             cfd = cfg.get_node_attributes(
                 node, ['deployment.pendingprofile', 'collective.managercandidates'])
             if not forcereply:
@@ -253,8 +256,8 @@ async def _handle_confluent_search(value, s, peer, uuidlookup, cloop):
             if await netutil.ip_on_same_subnet(theip, 'fe80::', 64):
                 if '%' in peer[0]:
                     ifidx = peer[0].split('%', 1)[1]
-                    iface = (await cloop.getaddrinfo(peer[0], 0, family=socket.AF_INET6,
-                                                     type=socket.SOCK_DGRAM))[0][-1][-1]
+                    iface = (await netutil._getaddrinfo(peer[0], 0, family=socket.AF_INET6,
+                                                        type=socket.SOCK_DGRAM))[0][-1][-1]
                 else:
                     ifidx = '{}'.format(peer[-1])
                     iface = peer[-1]
@@ -365,9 +368,7 @@ async def snoop(handler, byehandler=None, protocol=None, uuidlookup=None):
                         continue
                     _process_snoop(peer, rsp, mac, known_peers, newmacs, peerbymacaddress, byehandler, machandlers, handler)
                 elif method == b'M-SEARCH':
-                    if not uuidlookup or _in_tenant():
-                        # answering nodes that search for their deployment
-                        # server comes with tenant node-facing services
+                    if not uuidlookup:
                         continue
                     #ip = peer[0].partition('%')[0]
                     for headline in rsp[1:]:
