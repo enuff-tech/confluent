@@ -1,0 +1,15 @@
+# Lenovo(c) 2026 Apache 2.0
+# Network namespace of confluent tenant %i: created (or completed) on start,
+# with the uplinks declared in /etc/confluent/netns/%i.yaml.
+[Unit]
+Description=Confluent network namespace for tenant %i
+Before=confluent-nsbroker@%i.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/opt/confluent/bin/confluent-netns setup %i
+ExecStop=/opt/confluent/bin/confluent-netns teardown %i
+
+[Install]
+WantedBy=multi-user.target

@@ -46,6 +46,7 @@ class NetnsFactory(object):
     def __init__(self):
         self.prefix = 'cft%s' % uuid.uuid4().hex[:6]
         self.namespaces = []
+        self.processes = []
         self._count = 0
 
     def _name(self, tag):
@@ -65,19 +66,36 @@ class NetnsFactory(object):
 
         The caller picks the interface names inside each namespace, so two
         tenants can both have an ``up0`` with the same MAC and address.
+        ns_a may be None for the host's own namespace; the host end then
+        keeps a generated name (returned) and goes away with ns_b.
         """
         tmp_a, tmp_b = self._name('a'), self._name('b')
         _ip('link', 'add', tmp_a, 'type', 'veth', 'peer', 'name', tmp_b)
+        if ns_a is None:
+            name_a = tmp_a
         for ns, tmp, name, addr, mac in ((ns_a, tmp_a, name_a, addr_a, mac_a),
                                          (ns_b, tmp_b, name_b, addr_b, mac_b)):
-            _ip('link', 'set', tmp, 'netns', ns)
-            args = ['-n', ns, 'link', 'set', tmp, 'name', name]
+            prefix = []
+            if ns is not None:
+                _ip('link', 'set', tmp, 'netns', ns)
+                prefix = ['-n', ns]
+            args = prefix + ['link', 'set', tmp, 'name', name]
             if mac:
                 args += ['address', mac]
             _ip(*args)
             if addr:
-                _ip('-n', ns, 'addr', 'add', addr, 'dev', name)
-            _ip('-n', ns, 'link', 'set', name, 'up')
+                _ip(*(prefix + ['addr', 'add', addr, 'dev', name]))
+            _ip(*(prefix + ['link', 'set', name, 'up']))
+        return name_a
+
+    def spawn(self, ns, *cmd, **kwargs):
+        """Start a long-running process inside a namespace; stopped on
+        cleanup."""
+        kwargs.setdefault('stdout', subprocess.DEVNULL)
+        kwargs.setdefault('stderr', subprocess.DEVNULL)
+        proc = subprocess.Popen(('ip', 'netns', 'exec', ns) + cmd, **kwargs)
+        self.processes.append(proc)
+        return proc
 
     def run(self, ns, *cmd, **kwargs):
         """Run a command inside a namespace."""
@@ -90,6 +108,11 @@ class NetnsFactory(object):
         return os.stat(os.path.join('/run/netns', ns)).st_ino
 
     def cleanup(self):
+        for proc in self.processes:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+        self.processes = []
         for ns in reversed(self.namespaces):
             if ns.startswith(self.prefix):
                 subprocess.run(('ip', 'netns', 'del', ns), capture_output=True)

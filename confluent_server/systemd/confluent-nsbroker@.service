@@ -1,0 +1,41 @@
+# Lenovo(c) 2026 Apache 2.0
+# Network broker of confluent tenant %i: runs inside the tenant's network
+# namespace as the tenant's own user and hands sockets to the confluent
+# service. It holds only CAP_NET_RAW and CAP_NET_BIND_SERVICE.
+[Unit]
+Description=Confluent network broker for tenant %i
+BindsTo=confluent-netns@%i.service
+After=confluent-netns@%i.service
+
+[Service]
+Type=simple
+User=cfnsb-%i
+Group=cfnsb-%i
+NetworkNamespacePath=/run/netns/cf-%i
+# Name resolution of the tenant, if it has any.
+BindReadOnlyPaths=-/etc/netns/cf-%i/resolv.conf:/etc/resolv.conf
+BindReadOnlyPaths=-/etc/netns/cf-%i/hosts:/etc/hosts
+ExecStart=/opt/confluent/bin/confluent-nsbroker --tenant %i --socket /run/confluent/ns/%i/broker.sock --allow-user confluent
+AmbientCapabilities=CAP_NET_RAW CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_BIND_SERVICE
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ReadWritePaths=/run/confluent/ns/%i
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_PACKET AF_NETLINK
+SystemCallArchitectures=native
+SystemCallFilter=@system-service @network-io
+SystemCallErrorNumber=EPERM
+MemoryMax=128M
+TasksMax=64
+LimitNOFILE=4096
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
