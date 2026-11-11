@@ -23,6 +23,18 @@ sudo "$(command -v python3)" -m pytest -m netns -p no:cacheprovider
 
 CI runs both steps in the `server-tests` job of `.github/workflows/ci.yml`.
 
+## Multi-tenancy
+
+`tests/e2e/test_requirements.py` has one test per requirement of
+multi-tenancy (see `doc/multitenancy.md`), using two tenants through
+authorization and the API as their users would; the `test_tenant_*.py`
+files go deeper into each area. Its last test runs many tenants with
+identical networks; the numbers can be raised for a longer soak:
+
+```bash
+sudo CONFLUENT_SOAK_TENANTS=100 CONFLUENT_SOAK_ROUNDS=200     "$(command -v python3)" -m pytest -m netns -p no:cacheprovider tests/e2e
+```
+
 ## Fixtures
 
 - `confluent_config` gives each test its own empty configuration store in a
