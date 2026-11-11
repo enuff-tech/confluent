@@ -132,3 +132,30 @@ jobs:
             fi
           done
           exit "$rc"
+
+  server-tests:
+    name: Server tests (Python ${{ matrix.python }})
+    # Python 3.9 is unavailable on Ubuntu 26.04.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # The oldest interpreter the server runs on (el9), the one most
+        # supported distros ship (el10, noble), and the newest release.
+        python: ['3.9', '3.12', '3.14']
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install test dependencies
+        run: python -m pip install -r confluent_server/tests/requirements.txt
+      - name: Run tests
+        working-directory: confluent_server
+        run: python -m pytest
+      - name: Run network namespace tests as root
+        # These build real namespaces and veth pairs, so they need root.
+        # The unprivileged run above reports them as skipped.
+        working-directory: confluent_server
+        run: sudo "$(command -v python)" -m pytest -m netns -p no:cacheprovider
