@@ -289,6 +289,7 @@ async def _authorize_request(req, operation, reqbody):
 
     """
     authdata = None
+    keyinfo = None
     name = ''
     sessionid = None
     sessid = None
@@ -324,6 +325,10 @@ async def _authorize_request(req, operation, reqbody):
                         forwarder.close_session(sessionid)
                         del httpsessions[sessionid]
                         return ('logout',)
+                    denied = _session_apikey_denied(sessionid, operation,
+                                                    req.rel_url.path)
+                    if denied:
+                        return {'code': denied}
                     httpsessions[sessionid]['expiry'] = time.time() + 90
                     name = httpsessions[sessionid]['name']
                     authdata = auth.authorize(
@@ -341,9 +346,13 @@ async def _authorize_request(req, operation, reqbody):
             return ('logout',)
         authorization = req.headers['Authorization']
         if authorization.startswith('Bearer '):
-            name = apikey.validate_bearer_token(
+            keyinfo = apikey.validate_bearer(
                 authorization[7:], configmanager.ConfigManager(None))
+            name = keyinfo['username'] if keyinfo else None
             if name:
+                if not apikey.request_allowed(keyinfo, operation,
+                                              req.rel_url.path):
+                    return {'code': 403}
                 authdata = auth.authorize(
                     name, element=element, operation=operation)
                 if authdata is False:
@@ -372,6 +381,10 @@ async def _authorize_request(req, operation, reqbody):
                 return {'code': 401}
         if authdata:
             sessid = _establish_http_session(req, authdata, name, cookie)
+            if keyinfo:
+                # Later requests on this session are held to the same key:
+                # its scopes, its expiry and its revocation.
+                httpsessions[sessid]['apikey'] = keyinfo
     if authdata and element and element.startswith('/sessions/current/webauthn/validate/'):
         if not webauthn:
             raise exc.NotFoundException('WebAuthn support not available')
@@ -411,6 +424,21 @@ async def _authorize_request(req, operation, reqbody):
         return {'code': 401}
     else:
         return {'code': 403}
+
+def _session_apikey_denied(sessionid, operation, path):
+    """For a session established with an API key, an HTTP status when the
+    key no longer allows this request, else None."""
+    keyinfo = httpsessions[sessionid].get('apikey')
+    if keyinfo is None:
+        return None
+    if not apikey.key_is_current(configmanager.ConfigManager(None), keyinfo):
+        forwarder.close_session(sessionid)
+        del httpsessions[sessionid]
+        return 401
+    if not apikey.request_allowed(keyinfo, operation, path):
+        return 403
+    return None
+
 
 def _establish_http_session(req, authdata, name, cookie):
     sessid = util.randomstring(32)
@@ -505,6 +533,8 @@ async def wsock_handler(req):
     authtoken = authtoken.replace('ConfluentAuthToken:', '')
     authtoken = authtoken[:-1]
     if currsess['csrftoken'] != authtoken:
+        return
+    if _session_apikey_denied(sessid, 'start', req.rel_url.path):
         return
     httpsessions[sessid]['inflight'].add(rsp)
     name = httpsessions[sessid]['name']
@@ -1086,8 +1116,12 @@ async def resourcehandler_backend(req, make_response):
             tlvdata.unicode_dictvalues(sessinfo)
             await rsp.write(json.dumps(sessinfo).encode('utf8'))
             return rsp
-        elif url.startswith('/sessions/current/apikey/'):
-            status, apidata = await apikey.handle_api_request(
+        elif url.startswith('/sessions/current/apikey/') or url == '/sessions/current/apikeys' or url.startswith('/sessions/current/apikeys/'):
+            if url.startswith('/sessions/current/apikey/'):
+                handler = apikey.handle_api_request
+            else:
+                handler = apikey.handle_v2_request
+            status, apidata = await handler(
                 url, authorized['username'], cfgmgr, reqbody, operation)
             rsp = await make_response('application/json', status,
                                       cookies=cookies)
