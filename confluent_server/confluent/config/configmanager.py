@@ -2829,7 +2829,7 @@ class ConfigManager(object):
                     displayname = ucfg.get('displayname', None)
                     role = ucfg.get('role', None)
                     await self.create_user(user, uid=uid, displayname=displayname, role=role)
-                    for attrname in ('secret.apikey', 'webauthid', 'authenticators', 'cryptpass'):
+                    for attrname in ('secret.apikey', 'apikeys', 'webauthid', 'authenticators', 'cryptpass'):
                         if attrname in tmpconfig[confarea][user]:
                             self._cfgstore['users'][user][attrname] = tmpconfig[confarea][user][attrname]
                             _mark_dirtykey('users', user, self.tenant)
