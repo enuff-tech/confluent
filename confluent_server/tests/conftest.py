@@ -190,13 +190,35 @@ def aiohmi_state():
 
 
 @pytest.fixture(autouse=True)
-async def no_tasks_left_behind():
+def store_of_its_own(tmp_path):
+    """Give every test a configuration directory of its own, asked for or not.
+
+    Code under test makes a ConfigManager wherever it needs one, and the
+    first one loads the store from ConfigManager._cfgdir and writes changes
+    back there in a thread. A test that did not ask for confluent_config
+    would do that in /etc/confluent/cfg, or in the directory of whichever
+    test ran before it, and leave the thread to the tests after it. So the
+    directory is set for every test, and what the test left is written out
+    and forgotten when it ends.
+    """
+    _reset_module_state()
+    configmanager.ConfigManager._cfgdir = os.path.join(str(tmp_path), 'cfg')
+    yield
+    _flush()
+    _reset_module_state()
+
+
+@pytest.fixture(autouse=True)
+async def no_tasks_left_behind(store_of_its_own):
     """End every task a test started before its event loop is closed.
 
     Closing the loop cancels what is left once and waits for it. A task
     that misses that one cancellation (see confluent.tasks.cancel_all)
     would stall the run, so they are cancelled here until they are gone,
     and named if they will not go.
+
+    (After store_of_its_own in setup, so before it in teardown: the store
+    is written out once nothing changes it any more.)
     """
     yield
     disco = sys.modules.get('confluent.discovery.core')
@@ -226,14 +248,12 @@ async def no_tasks_left_behind():
 
 
 @pytest.fixture
-def confluent_config(tmp_path):
-    _flush()
-    _reset_module_state()
+def confluent_config(store_of_its_own, tmp_path):
     cfg = ConfluentConfig(str(tmp_path))
     cfg.start()
     yield cfg
-    _flush()
-    _reset_module_state()
+    # (written out and forgotten by store_of_its_own, after the test's tasks
+    # have ended)
 
 
 def pytest_collection_modifyitems(config, items):

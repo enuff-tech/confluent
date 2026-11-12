@@ -246,3 +246,20 @@ async def test_dump_starts_with_nothing_left_to_write(confluent_config, monkeypa
     assert not running and not alive
     assert any(name.split('.')[0] == 'nodegroups' for name in files), files
     assert dumped['nodegroups'] == {'everything': {'nodes': []}}
+
+
+def test_a_test_that_asks_for_no_store_still_has_its_own(tmp_path):
+    # (conftest.store_of_its_own) what makes a ConfigManager here must not
+    # read or write the installation's store, or an earlier test's
+    cm = configmanager.ConfigManager
+    assert cm._cfgdir == os.path.join(str(tmp_path), 'cfg')
+    assert configmanager._cfgstore is None and cm._cfgwriter is None
+    cm(None)
+    cm.wait_for_sync()
+    assert 'nodegroups' in set(name.split('.')[0] for name in os.listdir(cm._cfgdir))
+
+
+def test_and_leaves_nothing_to_the_next_one(tmp_path):
+    cm = configmanager.ConfigManager
+    assert configmanager._cfgstore is None and cm._cfgwriter is None
+    assert not os.path.exists(cm._cfgdir)
