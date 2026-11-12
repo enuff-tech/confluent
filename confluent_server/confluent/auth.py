@@ -351,6 +351,14 @@ def authorize(name, element, tenant=False, operation='create',
     return False
 
 
+def _stored_password(ucfg):
+    """What a cached password check was made against: a passphrase that
+    was right stops being right the moment the stored one changes (or is
+    removed), not when somebody next tries another."""
+    stored = ucfg.get('cryptpass')
+    return None if stored is None else tuple(stored)
+
+
 async def check_user_passphrase(name, passphrase, operation=None, element=None, tenant=False):
     """Check a a login name and passphrase for authenticity and authorization
 
@@ -407,7 +415,9 @@ async def check_user_passphrase(name, passphrase, operation=None, element=None, 
     elif not isinstance(passphrase, dict):
         bpassphrase = passphrase.encode('utf8')
     if (user, tenant) in _passcache and bpassphrase:
-        if hashlib.sha256(bpassphrase).digest() == _passcache[(user, tenant)]:
+        cached, checked = _passcache[(user, tenant)]
+        if (hashlib.sha256(bpassphrase).digest() == cached
+                and checked == _stored_password(ucfg)):
             return authorize(user, element, tenant, operation=operation)
         else:
             # In case of someone trying to guess,
@@ -435,7 +445,8 @@ async def check_user_passphrase(name, passphrase, operation=None, element=None, 
         # determine failure because there is a delay, valid response will
         # delay as well
         if crypt == crypted:
-            _passcache[(user, tenant)] = hashlib.sha256(bpassphrase).digest()
+            _passcache[(user, tenant)] = (hashlib.sha256(bpassphrase).digest(),
+                                          _stored_password(ucfg))
             return authorize(user, element, tenant, operation)
     if pam and tenant is None:
         # Host accounts (PAM) authenticate users of the main store only;
@@ -450,7 +461,8 @@ async def check_user_passphrase(name, passphrase, operation=None, element=None, 
         usergood = await asyncio.get_running_loop().run_in_executor(authworkers, pam_check, pwe, user, passphrase)
         if usergood:
             if bpassphrase:
-                _passcache[(user, tenant)] = hashlib.sha256(bpassphrase).digest()
+                _passcache[(user, tenant)] = (hashlib.sha256(bpassphrase).digest(),
+                                              _stored_password(ucfg))
             return authorize(user, element, tenant, operation, skipuserobj=False)
     await asyncio.sleep(0.05)  # stall even on test for existence of a username
     return None

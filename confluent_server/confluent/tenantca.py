@@ -169,10 +169,18 @@ async def server_context(tenant, names):
     authority for names. The certificate's key exists only in memory (and
     for a moment in a private temporary directory, as the TLS library
     loads it from a file)."""
-    cacert, cakey = await get_ca(tenant)
-    certpem, keypem = issue_server_certificate(cacert, cakey, names)
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.minimum_version = ssl.TLSVersion.TLSv1_2
+    await load_server_certificate(context, tenant, names)
+    return context
+
+
+async def load_server_certificate(context, tenant, names):
+    """Give context a fresh certificate of the tenant's authority for
+    names: what connections made from now on are shown. A service that
+    runs longer than a certificate lasts renews it this way."""
+    cacert, cakey = await get_ca(tenant)
+    certpem, keypem = issue_server_certificate(cacert, cakey, names)
     tmpdir = tempfile.mkdtemp(prefix='cftls')
     try:
         certfile = os.path.join(tmpdir, 'cert.pem')
@@ -184,4 +192,3 @@ async def server_context(tenant, names):
         context.load_cert_chain(certfile, keyfile)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
-    return context

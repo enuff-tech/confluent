@@ -124,9 +124,15 @@ async def redeem_enrollment(tenant, token, username, password):
     record = configmanager.get_tenant(tenantid)
     if not configmanager.multitenancy_enabled() or record['state'] != 'active':
         raise exc.ForbiddenRequest()
+    cfm = configmanager.ConfigManager(tenantid)
+    if _has_administrator(tenantid) or cfm.get_user(username) is not None:
+        # A token outlives what it was issued for when the tenant gets
+        # its users another way meanwhile (an imported package): it makes
+        # the first administrator, never one more, and never replaces a
+        # user that exists.
+        raise exc.ForbiddenRequest()
     if not await configmanager.consume_tenant_enrollment(tenantid, _token_hash(token)):
         raise exc.ForbiddenRequest()
-    cfm = configmanager.ConfigManager(tenantid)
     await cfm.create_user(username, role='Administrator',
                           attributemap={'password': password})
     return {'tenant': record['name'], 'username': username}
