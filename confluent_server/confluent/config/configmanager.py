@@ -3460,12 +3460,15 @@ class ConfigManager(object):
             storedir = self._cfgdir
         else:
             storedir = os.path.join(self._cfgdir, 'tenants', self.tenant)
-        for confarea in _config_areas:
-            try:
-                os.unlink(os.path.join(storedir, confarea))
-            except OSError as e:
-                if e.errno == 2:
-                    pass
+        # (not while the writer thread is in them: it holds this lock for
+        # the whole of a write, and a file that goes away under it fails it)
+        with _synclock:
+            for confarea in _config_areas:
+                try:
+                    os.unlink(os.path.join(storedir, confarea))
+                except OSError as e:
+                    if e.errno == 2:
+                        pass
         # Now we have to iterate through each fixed up element, using the
         # set attribute to flesh out inheritence and expressions
         idmap = _cfgstore.setdefault('main', {}).get('idmap', None)
@@ -3480,10 +3483,11 @@ class ConfigManager(object):
         if self.tenant is None and not merge:
             # Rewrite the id map file from memory so entries of replaced
             # users do not come back from disk on the next start.
-            try:
-                os.unlink(os.path.join(storedir, 'idmap'))
-            except OSError:
-                pass
+            with _synclock:
+                try:
+                    os.unlink(os.path.join(storedir, 'idmap'))
+                except OSError:
+                    pass
             for uid in _cfgstore['main']['idmap']:
                 _mark_dirtykey('idmap', uid)
         attribmerge = merge if merge else "replace"

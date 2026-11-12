@@ -263,3 +263,33 @@ def test_and_leaves_nothing_to_the_next_one(tmp_path):
     cm = configmanager.ConfigManager
     assert configmanager._cfgstore is None and cm._cfgwriter is None
     assert not os.path.exists(cm._cfgdir)
+
+
+async def test_restore_removes_store_files_only_between_writes(confluent_config, monkeypatch):
+    # A restore (or a tenant import) starts by removing the files of the
+    # store it replaces. The writer thread may be in those files: it holds
+    # _synclock for the whole of a write, so that is when they may go.
+    configmanager.init_masterkey()
+    configmanager.set_global('multitenancy.enabled', True)
+    tid = await configmanager.create_tenant('acme')
+    removed = []
+    unlink = os.unlink
+
+    def watched_unlink(path, *args, **kwargs):
+        if str(path).startswith(confluent_config.cfgdir):
+            removed.append((os.path.relpath(str(path), confluent_config.cfgdir),
+                            configmanager._synclock._is_owned()))
+        return unlink(path, *args, **kwargs)
+
+    for tenant in (None, tid):
+        cfm = configmanager.ConfigManager(tenant)
+        await _make_cluster(cfm)
+        confluent_config.flush()
+        dump = cfm._real_dump_to_json()
+        monkeypatch.setattr(os, 'unlink', watched_unlink)
+        await cfm._load_from_json(dump)
+        monkeypatch.setattr(os, 'unlink', unlink)
+        confluent_config.flush()
+    assert any(name == 'nodes' for name, _ in removed)
+    assert any(name == os.path.join('tenants', tid, 'nodes') for name, _ in removed)
+    assert [name for name, locked in removed if not locked] == []
