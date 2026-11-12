@@ -12,7 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import dbm
 import os
+import pickle
+
+import pytest
 
 import confluent.config.configmanager as configmanager
 
@@ -293,3 +297,94 @@ async def test_restore_removes_store_files_only_between_writes(confluent_config,
     assert any(name == 'nodes' for name, _ in removed)
     assert any(name == os.path.join('tenants', tid, 'nodes') for name, _ in removed)
     assert [name for name, locked in removed if not locked] == []
+
+
+def _sqlite_store():
+    import tempfile
+    with tempfile.TemporaryDirectory() as scratch:
+        name = os.path.join(scratch, 'probe')
+        dbm.open(name, 'c').close()
+        return dbm.whichdb(name) == 'dbm.sqlite3'
+
+
+sqlite_store = pytest.mark.skipif(
+    not _sqlite_store(), reason='the dbm of this Python does not write sqlite files')
+
+
+@sqlite_store
+async def test_a_file_of_the_store_is_written_in_one_transaction(confluent_config, monkeypatch):
+    # (every key committed by itself waits for the disk once per key)
+    cfm = confluent_config.manager()
+    await _make_cluster(cfm)
+    confluent_config.flush()
+    statements = {}
+    opened = dbm.open
+
+    def watched_open(path, flag='r', mode=0o666):
+        db = opened(path, flag, mode)
+        if flag != 'r':
+            db._cx.set_trace_callback(
+                statements.setdefault(os.path.basename(path), []).append)
+        return db
+
+    monkeypatch.setattr(dbm, 'open', watched_open)
+    nodes = dict(('extra{0}'.format(n), {'console.method': 'ipmi'}) for n in range(40))
+    await cfm.set_node_attributes(nodes, autocreate=True)
+    confluent_config.flush()
+    monkeypatch.setattr(dbm, 'open', opened)
+    seen = [s.split()[0].upper() for s in statements['nodes']]
+    written = [n for n, s in enumerate(seen) if s == 'REPLACE']
+    assert len(written) >= 40
+    assert seen.count('BEGIN') == seen.count('COMMIT') >= 1
+    # every key is written inside a transaction, and few of those are needed
+    for at in written:
+        before = seen[:at]
+        assert before.count('BEGIN') == before.count('COMMIT') + 1
+    assert seen.count('COMMIT') <= 3
+    confluent_config.restart()
+    assert set(nodes) <= set(confluent_config.manager().list_nodes())
+
+
+@sqlite_store
+async def test_a_write_that_fails_leaves_the_file_as_it_was(confluent_config, monkeypatch):
+    cfm = confluent_config.manager()
+    await _make_cluster(cfm)
+    confluent_config.flush()
+
+    def stored():
+        db = dbm.open(os.path.join(confluent_config.cfgdir, 'nodes'), 'r')
+        try:
+            return dict((key.decode(), pickle.loads(db[key])) for key in db.keys())
+        finally:
+            db.close()
+
+    before = stored()
+    assert before
+    dumps = pickle.dumps
+    count = []
+
+    def failing_dumps(value, *args, **kwargs):
+        count.append(1)
+        if len(count) == 20:
+            raise RuntimeError('the disk is gone')
+        return dumps(value, *args, **kwargs)
+
+    await cfm.set_node_attributes(
+        dict(('late{0}'.format(n), {'console.method': 'ipmi'}) for n in range(40)),
+        autocreate=True)
+    configmanager.ConfigManager._cfgwriter.join()
+    cm = configmanager.ConfigManager
+    monkeypatch.setattr(configmanager.cPickle, 'dumps', failing_dumps)
+    monkeypatch.setattr('threading.excepthook', lambda args: None)
+    await cfm.set_node_attributes(
+        dict(('later{0}'.format(n), {'console.method': 'ipmi'}) for n in range(40)),
+        autocreate=True)
+    cm._cfgwriter.join()
+    monkeypatch.setattr(configmanager.cPickle, 'dumps', dumps)
+    assert len(count) >= 20, 'the write was interrupted'
+    after = stored()
+    assert not [name for name in after if name.startswith('later')]
+    assert dict((k, v) for k, v in after.items() if not k.startswith('late')) == before
+    # and the next write makes up for it (a full one, as after any failure)
+    confluent_config.flush()
+    assert len([name for name in stored() if name.startswith('later')]) == 40

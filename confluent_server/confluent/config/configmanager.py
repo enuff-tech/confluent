@@ -635,6 +635,33 @@ def crypt_value(value,
     return iv, cryptval, hmac, b'\x02'
 
 
+def _begin_write(dbf):
+    """Start one transaction for what is about to be written to dbf.
+
+    The sqlite backend of dbm (the default from Python 3.13) commits every
+    key by itself, and every commit waits for the disk: a thousand changed
+    nodes are a thousand waits. In one transaction they are one, and the
+    file has either all of a write or none of it. Other backends write a
+    file at once as they are, and for them this does nothing.
+
+    Returns what _commit_write is to be given. A write that is not
+    committed (an exception on the way) is rolled back when dbf is closed.
+    """
+    connection = getattr(dbf, '_cx', None)
+    if connection is None:
+        return None
+    try:
+        connection.execute('BEGIN')
+    except Exception:
+        return None  # as before: every key by itself
+    return connection
+
+
+def _commit_write(connection):
+    if connection is not None:
+        connection.execute('COMMIT')
+
+
 def _load_dict_from_dbm(dpath, tdb):
     try:
         dbe = dbm.open(tdb, 'r')
@@ -3703,6 +3730,7 @@ class ConfigManager(object):
                     os.remove(os.path.join(cls._cfgdir, "globals"))
                     globalf = dbm.open(os.path.join(cls._cfgdir, "globals"), 'c', 384)  # 0600
                 try:
+                    writing = _begin_write(globalf)
                     for globalkey in dirtyglobals:
                         if globalkey in _cfgstore['globals']:
                             globalf[globalkey] = \
@@ -3710,6 +3738,7 @@ class ConfigManager(object):
                         else:
                             if globalkey in globalf:
                                 del globalf[globalkey]
+                    _commit_write(writing)
                 finally:
                     globalf.close()
             if fullsync or 'collectivedirty' in _cfgstore:
@@ -3730,6 +3759,7 @@ class ConfigManager(object):
                             with _dirtylock:
                                 colls = copy.deepcopy(_cfgstore['collectivedirty'])
                                 del _cfgstore['collectivedirty']
+                        writing = _begin_write(collectivef)
                         for coll in colls:
                             if coll in _cfgstore['collective']:
                                 collectivef[coll] = cPickle.dumps(
@@ -3737,6 +3767,7 @@ class ConfigManager(object):
                             else:
                                 if coll in collectivef:
                                     del collectivef[coll]
+                        _commit_write(writing)
                     finally:
                         collectivef.close()
                 else:
@@ -3762,8 +3793,10 @@ class ConfigManager(object):
                             os.remove(os.path.join(pathname, category))
                             dbf = dbm.open(os.path.join(pathname, category), 'c', 384)  # 0600
                         try:
+                            writing = _begin_write(dbf)
                             for ck in currdict[category]:
                                 dbf[ck] = cPickle.dumps(currdict[category][ck], protocol=cPickle.HIGHEST_PROTOCOL)
+                            _commit_write(writing)
                         finally:
                             dbf.close()
             elif 'dirtykeys' in _cfgstore:
@@ -3792,12 +3825,14 @@ class ConfigManager(object):
                             os.remove(os.path.join(pathname, category))
                             dbf = dbm.open(os.path.join(pathname, category), 'c', 384)  # 0600
                         try:
+                            writing = _begin_write(dbf)
                             for ck in dkdict[category]:
                                 if ck not in catdict:
                                     if ck in dbf:
                                         del dbf[ck]
                                 else:
                                     dbf[ck] = cPickle.dumps(catdict[ck], protocol=cPickle.HIGHEST_PROTOCOL)
+                            _commit_write(writing)
                         finally:
                             dbf.close()
             with _dirtylock:
