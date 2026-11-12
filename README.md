@@ -15,6 +15,83 @@ Check [this page](https://xcat2.github.io/confluent-docs/) for a more detailed l
 Confluent is the modern successor of [xCAT](https://github.com/xcat2/xcat-core).
 If you're coming from xCAT, check out [this comparison](https://xcat2.github.io/confluent-docs/miscellaneous/confluentvxcat/).
 
+# Multi-tenancy (this fork)
+
+[![CI of this fork](https://github.com/enuff-tech/confluent/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/enuff-tech/confluent/actions/workflows/ci.yml?query=branch%3Amaster)
+
+This repository is a fork of [xcat2/confluent](https://github.com/xcat2/confluent). Its `master`
+adds multi-tenancy to the server: one confluent service manages the infrastructure of several
+tenants, each of which controls its own cluster and cannot see or reach another's. None of it has
+been proposed upstream yet, and the badges at the top of this page are upstream's.
+
+It is off by default, and an installation that does not turn it on behaves as before. The full
+description, including what it does and does not protect against, is in
+[doc/multitenancy.md](doc/multitenancy.md).
+
+## What a tenant has of its own
+
+| Area | Per tenant |
+|---|---|
+| Configuration | Nodes, groups, attributes, users and roles, API keys. Two tenants can use the same node names, addresses, MAC addresses, UUIDs and serial numbers. |
+| Network | A Linux network namespace with the uplinks the platform gives it (a physical interface or a VLAN). The tenant sets addresses, routes and name servers itself. Identical networks in two tenants do not meet. |
+| Hardware management | Power, boot device, health, sensors, inventory, event log, BMC settings, consoles and shells, through the tenant's network. |
+| Discovery | SSDP, SLP and PXE/DHCP listeners in the tenant's network; everything discovered is kept per tenant. |
+| Switches | MAC tables and LLDP neighbors, with the tenant's credentials. |
+| Deployment | OS media uploaded and imported by the tenant, its own profiles, UEFI HTTP boot and iPXE from its own content, DHCP or static addressing per node. |
+| Trust | A TLS certificate authority and an SSH certificate authority per tenant; secrets encrypted under a key per tenant. |
+| Logs | Events, audit records and console logs in a directory per tenant. |
+| Portability | A tenant can be exported and imported as an installation of its own, and the other way round. |
+
+## How it is kept apart
+
+- **Roles.** A *platform administrator* creates, disables and deletes tenants and gives them their
+  network uplinks, and has no access to a tenant's nodes, discovery, network, events or users. A
+  tenant's users log in as `tenant/user` and are checked against the tenant's own user list only.
+- **Network.** The service never enters a tenant's namespace. Every socket it uses for a tenant is
+  opened inside that namespace by a small per-tenant broker running as its own user, and work done
+  for a tenant is refused rather than done from the host's network.
+- **Untrusted media.** OS media a tenant uploads is identified and unpacked by worker processes
+  confined with resource limits, namespaces of their own and Landlock, and is refused on a host
+  that can provide neither of the last two.
+- **The limit of it.** The host's root user and the confluent service user can see everything.
+  A customer that needs a boundary against the operator of the host should run its own server.
+
+## Trying it
+
+    confluenttenant multitenancy on
+    confluenttenant create acme
+    confluenttenant enroll acme           # a one-time token for the tenant's first administrator
+    confluent-netns setup <id>
+    confluent-netns attach <id> eth1 --vlan 100
+    systemctl enable --now confluent-netns@<id> confluent-netcfg@<id> confluent-nsbroker@<id>
+
+`confluent_selfcheck` and `confluent-netns sandbox` report what the host provides for confining
+tenant media. An existing installation is first brought to the current store layout with
+`confluentdbutil migrate-tenancy`.
+
+## Not available to tenants yet
+
+Firmware updates, virtual media, remote configuration (ansible, file synchronization), identity
+images, TFTP boot, editing profiles through the API, reading their own event and audit logs through
+the API, and the web interface.
+
+## Other changes in this fork
+
+- A test suite for the server (`confluent_server/tests`, described in its
+  [README](confluent_server/tests/README.md)), run on Python 3.9, 3.12 and 3.14 in CI: about 450
+  tests without privileges and 70 more that build real network namespaces as root.
+- Fixes to the configuration store found on the way: a restore no longer removes files the
+  background writer is in, a dump waits for pending writes, and with the sqlite backend of `dbm`
+  (Python 3.13 and later) a file is written in one transaction instead of one per key.
+- A tool that measures the store at scale (`confluent_server/tests/tools/storescale.py`). On an
+  SSD array, a million nodes of 500 tenants took about 10 GB of memory and under a minute to load.
+
+## State
+
+Everything above is covered by the test suite, including two tenants with identical networks side
+by side. It has not yet been run as an installed service deploying real machines, in a collective,
+or from the built packages; treat it as work in progress until it has.
+
 # Documentation
 
 Confluent documentation is hosted on: https://xcat2.github.io/confluent-docs/

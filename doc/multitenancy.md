@@ -186,6 +186,8 @@ A tenant's nodes are served inside the tenant's network:
 - The credential service on 13001.
 
 A node never names its tenant: it is the one whose listener it reached.
+The server certificate is valid for 90 days and is issued again every
+week while the service runs, for the addresses the tenant has then.
 
 The tenant's content lives under `/var/lib/confluent/tenants/<id>/`:
 `public` and `private`, laid out like `/var/lib/confluent/public` and
@@ -351,9 +353,6 @@ turned on.
   remote configuration and identity images are not available to tenants.
 - Each tenant keeps its own copy of the OS images it imports.
 - TFTP boot is not available to tenants.
-- A tenant's server certificate is issued when its listeners start
-  (valid 90 days) and is not renewed without a restart of the service or
-  of the tenant.
 - Tenants cannot read their own event or audit logs through the API.
 - A tenant's switches are queried in the service's main process.
 - The terminal buffer service that backs consoles is shared by all
