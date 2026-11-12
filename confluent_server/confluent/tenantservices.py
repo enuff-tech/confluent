@@ -53,6 +53,9 @@ HTTPS_PORT = 443
 HTTP_PORT = 80
 CRED_PORT = 13001
 RETRY = 30
+# A server certificate lasts tenantca.SERVER_DAYS; the service may run
+# longer than that, and a tenant's addresses change.
+RENEW = 7 * 86400
 _services = {}
 
 _SECURITY_HEADERS = {
@@ -277,14 +280,9 @@ async def _serve(tenant, state):
                 log.service_log({'info': 'Nodes of tenant {0} are not served until its '
                                  'network is available: {1}'.format(tenant, e)})
             await asyncio.sleep(RETRY)
-    names = set()
-    for iface in interfaces:
-        for key in ('ipv4', 'ipv6'):
-            for addr in iface.get(key, []):
-                addr = ipaddress.ip_interface(addr).ip
-                if not addr.is_loopback:
-                    names.add(str(addr))
+    names = _names(interfaces)
     context = await tenantca.server_context(tenant, names or {'localhost'})
+    state['tasks'].append(tasks.spawn_task(_renew_certificate(tenant, net, context, names)))
     try:
         # what its nodes are given to trust, and its boot loaders
         await tenantsite.ensure(tenant)
@@ -314,6 +312,34 @@ async def _serve(tenant, state):
     state['serving'] = True
     log.service_log({'info': 'Serving the nodes of tenant {0} in its network '
                      '({1})'.format(tenant, ', '.join(sorted(names)))})
+
+
+def _names(interfaces):
+    names = set()
+    for iface in interfaces:
+        for key in ('ipv4', 'ipv6'):
+            for addr in iface.get(key, []):
+                addr = ipaddress.ip_interface(addr).ip
+                if not addr.is_loopback:
+                    names.add(str(addr))
+    return names
+
+
+async def _renew_certificate(tenant, net, context, names):
+    """Keep the certificate a tenant's nodes are shown valid, and for the
+    addresses the tenant has now, for as long as its nodes are served."""
+    while True:
+        await asyncio.sleep(RENEW)
+        try:
+            try:
+                names = _names(await net.alist_interfaces())
+            except tenantnet.TenantNetworkError:
+                pass  # the addresses it had, until its network answers
+            await tenantca.load_server_certificate(context, tenant, names or {'localhost'})
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.logtrace()
 
 
 def _tenant_state_changed(tenant, state):
