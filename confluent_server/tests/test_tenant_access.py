@@ -127,6 +127,25 @@ async def test_enrollment_creates_the_first_administrator_once(mt):
         await _api('/tenants/acme/enrollment', 'create')
 
 
+@pytest.mark.parametrize('case', ['administrator', 'same-name'])
+async def test_enrollment_never_adds_to_existing_users(mt, case):
+    # the tenant got its users another way while a token was out (an
+    # imported package): the token is refused and stays unused
+    record = await tenancy.create('acme')
+    tenant = configmanager.ConfigManager(record['id'])
+    if case == 'administrator':
+        await tenant.create_user('boss', role='Administrator')
+    else:
+        await tenant.create_user('admin', role='Monitor')
+    with pytest.raises(exc.ForbiddenRequest):
+        await tenancy.redeem_enrollment('acme', record['enrollment_token'], 'admin', PASSWORD)
+    assert tenant.list_users() == ['boss' if case == 'administrator' else 'admin']
+    assert 'cryptpass' not in tenant.get_user(tenant.list_users()[0])
+    assert tenancy.public_record(record['id'])['enrollment_pending']
+    if case == 'same-name':
+        await tenancy.redeem_enrollment('acme', record['enrollment_token'], 'other', PASSWORD)
+
+
 @pytest.mark.parametrize('case', ['wrong-token', 'unknown-tenant', 'disabled', 'expired', 'multitenancy-off'])
 async def test_enrollment_refused(mt, monkeypatch, case):
     record = await tenancy.create('acme')
@@ -303,6 +322,19 @@ async def test_tenant_password_login(mt):
                                                element='/nodes/')
     assert granted[3] == tid and granted[2] == 'admin'
     assert await auth.check_user_passphrase('acme/admin', 'wrong password') is None
+
+
+async def test_a_changed_password_ends_the_old_one_at_once(mt):
+    tid = await _tenant('acme')
+    tenant = configmanager.ConfigManager(tid)
+    assert await auth.check_user_passphrase('acme/admin', PASSWORD)
+    assert await auth.check_user_passphrase('acme/admin', PASSWORD)  # (from the cache)
+    await tenant.set_user('admin', {'password': 'another long password'})
+    assert await auth.check_user_passphrase('acme/admin', PASSWORD) is None
+    assert await auth.check_user_passphrase('acme/admin', 'another long password')
+    # and without a stored password, none is right
+    tenant._cfgstore['users']['admin'].pop('cryptpass')
+    assert await auth.check_user_passphrase('acme/admin', 'another long password') is None
 
 
 async def test_host_accounts_never_authenticate_tenant_users(mt, monkeypatch):

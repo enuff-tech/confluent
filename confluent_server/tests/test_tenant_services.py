@@ -26,6 +26,7 @@ import hashlib
 import hmac
 import json
 import os
+import ssl
 import subprocess
 import sys
 
@@ -133,6 +134,55 @@ async def test_each_tenant_has_its_own_authority(tenancy):
     assert names.get_values_for_type(x509.DNSName) == ['confluent.a']
     with pytest.raises(ValueError):
         await tenantca.get_ca(None)
+
+
+async def test_server_certificate_is_renewed_while_serving(tenancy, monkeypatch):
+    _create(A)
+
+    class Net(object):
+        addresses = ['192.0.2.1/24']
+
+        async def alist_interfaces(self):
+            if self.addresses is None:
+                raise tenantnet.TenantNetworkError('gone')
+            return [{'ipv4': self.addresses, 'ipv6': ['::1/128']}]
+
+    async def shown():
+        pem = await asyncio.get_running_loop().run_in_executor(
+            None, ssl.get_server_certificate, ('127.0.0.1', port))
+        cert = x509.load_pem_x509_certificate(pem.encode())
+        alt = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+        return cert.serial_number, [str(ip) for ip in alt.get_values_for_type(x509.IPAddress)]
+
+    async def answer(reader, writer):
+        writer.close()
+
+    net = Net()
+    context = await tenantca.server_context(A, {'192.0.2.1'})
+    server = await asyncio.start_server(answer, '127.0.0.1', 0, ssl=context)
+    port = server.sockets[0].getsockname()[1]
+    first = await shown()
+    assert first[1] == ['192.0.2.1'] and await shown() == first
+    monkeypatch.setattr(services, 'RENEW', 0.05)
+    net.addresses = ['192.0.2.1/24', '192.0.2.9/24']
+    renewal = asyncio.ensure_future(
+        services._renew_certificate(A, net, context, {'192.0.2.1'}))
+    try:
+        for _ in range(100):
+            second = await shown()
+            if second[1] == ['192.0.2.1', '192.0.2.9']:
+                break
+            await asyncio.sleep(0.05)
+        assert second[0] != first[0] and second[1] == ['192.0.2.1', '192.0.2.9']
+        # its network not answering: renewed for the addresses it had
+        net.addresses = None
+        await asyncio.sleep(0.3)
+        third = await shown()
+        assert third[0] != second[0] and third[1] == second[1]
+    finally:
+        renewal.cancel()
+        server.close()
+        await server.wait_closed()
 
 
 async def test_only_active_tenants_are_served(tenancy):
