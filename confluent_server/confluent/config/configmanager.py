@@ -3538,6 +3538,12 @@ class ConfigManager(object):
         The dump is produced by a worker process reading the on-disk store of
         this configuration's tenant from this configuration's directory.
         """
+        # The worker reads what is on disk, and a file that is being written
+        # reads as damaged or empty: so nothing is left to write when it
+        # starts. That includes what making this very object changed (the
+        # first ConfigManager of an empty store creates its 'everything'
+        # group), which a caller that waited beforehand has not waited for.
+        self.wait_for_sync()
         args = [sys.executable, __file__, '-r' if redact else '',
                 '--cfgdir', self._cfgdir]
         if self.tenant is not None:

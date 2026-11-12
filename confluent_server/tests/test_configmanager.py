@@ -211,3 +211,38 @@ async def test_restart_does_not_touch_other_directories(confluent_config, tmp_pa
     await _make_cluster(cfm)
     confluent_config.flush()
     assert sorted(p.name for p in tmp_path.iterdir()) == ['cfg']
+
+
+async def test_dump_starts_with_nothing_left_to_write(confluent_config, monkeypatch):
+    # The dump is read from disk by a worker, and a file that is being
+    # written reads as empty or damaged there. The first manager of an
+    # empty store changes it (the 'everything' group): after the caller
+    # has waited for the store to be written, as the backup does.
+    import asyncio
+    import json
+    import time
+    cm = configmanager.ConfigManager
+    write = cm._sync_to_file.__func__
+    seen = []
+
+    def slow_write(cls, fullsync=False):
+        time.sleep(0.3)  # a slow disk
+        return write(cls, fullsync)
+
+    spawn = asyncio.create_subprocess_exec
+
+    async def watched_spawn(*args, **kwargs):
+        seen.append((cm._syncrunning, cm._cfgwriter is not None and cm._cfgwriter.is_alive(),
+                     sorted(os.listdir(confluent_config.cfgdir))))
+        return await spawn(*args, **kwargs)
+
+    monkeypatch.setattr(cm, '_sync_to_file', classmethod(slow_write))
+    monkeypatch.setattr(asyncio, 'create_subprocess_exec', watched_spawn)
+    assert 'nodegroups' not in configmanager._cfgstore.get('main', {})
+    cm.wait_for_sync()
+    dumped = json.loads(await cm(None)._dump_to_json())
+    assert len(seen) == 1
+    running, alive, files = seen[0]
+    assert not running and not alive
+    assert any(name.split('.')[0] == 'nodegroups' for name in files), files
+    assert dumped['nodegroups'] == {'everything': {'nodes': []}}
