@@ -34,6 +34,7 @@ is a matter of policy (see refusal()): not unless the namespaces or
 Landlock apply, by default.
 """
 
+import contextvars
 import ctypes
 import os
 import resource
@@ -254,7 +255,11 @@ _supported = []
 def supported():
     """What of confine() works on this host (found out once)."""
     if not _supported:
-        _supported.append(tuple(applied()))
+        # Finding out starts a process, which is refused in a tenant's
+        # context (tenantguard). The first to ask can be a tenant's request -
+        # multi-tenancy switched on while the service runs - so ask in a
+        # context of no tenant: nothing a tenant controls is involved.
+        _supported.append(tuple(contextvars.Context().run(applied)))
     return _supported[0]
 
 

@@ -171,6 +171,27 @@ def test_only_what_was_found_to_work_is_tried(monkeypatch):
     assert done.returncode == 0 and done.stdout.strip()
 
 
+def test_finding_out_what_works_is_not_refused_in_a_tenants_context(monkeypatch):
+    """Seen on a trial installation: multi-tenancy was switched on while the
+    service ran, so the first to ask what the host provides was a tenant's
+    import - and the process that finds out was refused like any process a
+    tenant's request would start ("os.fork refused")."""
+    from confluent import tenantguard
+    monkeypatch.setattr(sandbox, '_supported', [])
+    tenantguard.install()
+
+    def as_tenant():
+        tenantguard.enter('t00000000000a')
+        with pytest.raises(tenantguard.TenantNetworkViolation):
+            subprocess.run(['true'])
+        return sandbox.supported()
+
+    import contextvars
+    found = contextvars.copy_context().run(as_tenant)
+    assert found == tuple(sandbox.applied()) and 'limits' in found
+    assert tenantguard.current_tenant.get() is None
+
+
 # ------------------------------------------------------- the media workers
 
 def _iso(path, release='rocky-release-9.4-1.6.el9.noarch.rpm', arch=b'x86_64', extra=()):
