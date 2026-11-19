@@ -20,6 +20,7 @@ actual media workers are run confined on an actual (small) ISO image.
 """
 
 import asyncio
+import ctypes
 import json
 import os
 import socket
@@ -285,6 +286,53 @@ def test_found_out_for_the_user_the_service_runs_as():
     found = sandbox.applied(user=(65534, 65534))
     assert found[0] == 'limits' and set(found) <= set(sandbox.LAYERS)
     assert os.getuid() == 0  # (the one that asked is who it was)
+
+
+def test_becoming_the_service_user_leaves_its_own_proc_entries_to_it(monkeypatch):
+    # (after a change of user the kernel hands /proc/self to root until
+    # the process is "dumpable" again; without that the user cannot write
+    # its uid_map, and root would find the namespaces missing for it)
+    for name in ('setgroups', 'setgid', 'setuid'):
+        monkeypatch.setattr(os, name, lambda *args: None)
+    libc = ctypes.CDLL(None)
+    receive, send = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        try:
+            libc.prctl(sandbox.PR_SET_DUMPABLE, 0, 0, 0, 0)
+            sandbox._become((os.getuid(), os.getgid()))
+            os.write(send, str(libc.prctl(3, 0, 0, 0, 0)).encode())  # PR_GET_DUMPABLE
+        finally:
+            os._exit(0)
+    os.close(send)
+    with os.fdopen(receive, 'rb') as result:
+        told = result.read().decode()
+    os.waitpid(pid, 0)
+    assert told == '1'
+
+
+def test_root_finds_for_the_service_user_what_that_user_finds_itself():
+    if os.getuid() != 0:
+        pytest.skip('root asks on behalf of the service user')
+    receive, send = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        try:
+            os.close(receive)
+            os.setgroups([])
+            os.setgid(65534)
+            os.setuid(65534)
+            os.set_inheritable(send, True)
+            os.execv(sys.executable, [sys.executable, '-c',
+                     'import os, sys; sys.path[:0] = {0!r}; from confluent import sandbox; '
+                     'os.write({1}, ",".join(sandbox.applied()).encode())'.format(sys.path, send)])
+        finally:
+            os._exit(1)
+    os.close(send)
+    with os.fdopen(receive, 'rb') as result:
+        itself = result.read().decode().split(',')
+    os.waitpid(pid, 0)
+    assert sandbox.applied(user=(65534, 65534)) == itself
 
 
 # ----------------------------------------------- what a host lacks, and why

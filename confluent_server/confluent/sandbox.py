@@ -45,6 +45,7 @@ CLONE_NEWUSER = 0x10000000
 CLONE_NEWIPC = 0x08000000
 CLONE_NEWNET = 0x40000000
 MS_NOSUID, MS_NODEV, MS_NOEXEC, MS_REC, MS_PRIVATE = 2, 4, 8, 0x4000, 1 << 18
+PR_SET_DUMPABLE = 4
 PR_SET_NO_NEW_PRIVS = 38
 PR_CAPBSET_DROP = 24
 PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL = 47, 4
@@ -263,6 +264,18 @@ def supported():
     return _supported[0]
 
 
+def _become(user):
+    """Be user, (uid, gid), as a process that user started would be."""
+    os.setgroups([])
+    os.setgid(user[1])
+    os.setuid(user[0])
+    # Changing user leaves /proc/self owned by root (the process is no
+    # longer "dumpable"), and the new user may then not write its own
+    # uid_map: the namespaces would be found missing for a service user
+    # that gets them. A process that user starts has no such mark.
+    _libc().prctl(PR_SET_DUMPABLE, 1, 0, 0, 0)
+
+
 def applied(read=(), write=(), user=None):
     """What confine() manages to apply on this host, found out in a
     process made for it: a list of 'limits', 'namespaces', 'landlock'.
@@ -276,9 +289,7 @@ def applied(read=(), write=(), user=None):
         try:
             os.close(receive)
             if user is not None:
-                os.setgroups([])
-                os.setgid(user[1])
-                os.setuid(user[0])
+                _become(user)
             confine(read, write, report=send)
         finally:
             os._exit(0)
