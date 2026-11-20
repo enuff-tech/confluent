@@ -63,6 +63,8 @@ async def register_endpoint(options, session, addr):
             total = rsp['count']
         elif total > 1:
             current += 1
+            # total is the count the server sent, more than 1 here
+            # pyrefly: ignore[division-by-zero]
             sys.stdout.write('\x1b[2K\r{0:.1f}% Scanned'.format(100 * current / total))
             sys.stdout.flush()
             neednewline = True
