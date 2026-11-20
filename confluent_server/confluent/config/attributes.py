@@ -218,6 +218,22 @@ node = {
     'deployment.client_ip': {
         'description': ('Client IP used when most recently reporting state.')
     },
+    'deployment.installedargs': {
+        'description': ('Additional kernel command line arguments for the '
+                        'installed OS, appended after the installedargs of '
+                        'the profile. They are written to the bootloader '
+                        'configuration at install time, and are not applied '
+                        'to systems that are already installed. Characters '
+                        'that GRUB treats specially, such as &, ;, |, <, >, $ '
+                        'and quotes, are not supported.'),
+    },
+    'deployment.kernelargs': {
+        'description': ('Additional kernel command line arguments to pass at '
+                        'network boot, appended after the kernelargs of the '
+                        'profile. These arguments are not made '
+                        'persistent in the installed OS, except on SUSE 16, '
+                        'whose installer keeps its own kernel arguments.'),
+    },
     'deployment.lock': {
         'description': ('Indicates whether deployment actions should be impeded. '
                         'If locked, it indicates that a pending profile should not be applied. '

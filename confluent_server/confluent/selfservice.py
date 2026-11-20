@@ -53,7 +53,9 @@ def cleanup_inflight_sshcerts():
 
 
 def yamldump(input):
-    return yaml.dump_all([input], Dumper=SafeDumper, default_flow_style=False).encode()
+    # no line wrapping, the deployment scripts read values with grep. This is
+    # the largest width the libyaml emitter accepts
+    return yaml.dump_all([input], Dumper=SafeDumper, default_flow_style=False, width=2**31 - 1).encode()
 
 def jsondump(input):
     return json.dumps(input).encode()
@@ -314,7 +316,13 @@ async def handle_request(req, make_response, mimetype, tenant=None,
         cfd = cfg.get_node_attributes(nodename, '*', decrypt=True).get(nodename, {})
         rsp = {}
         for k in cfd:
-            if k.startswith('secret') or k.startswith('crypt') or 'value' not in cfd[k] or not cfd[k]['value']:
+            if k.startswith('secret') or k.startswith('crypt'):
+                continue
+            if isinstance(cfd[k], list):
+                if cfd[k]:
+                    rsp[k] = cfd[k]
+                continue
+            if 'value' not in cfd[k] or not cfd[k]['value']:
                 continue
             rsp[k] = cfd[k]['value']
             if isinstance(rsp[k], bytes):
@@ -362,6 +370,11 @@ async def handle_request(req, make_response, mimetype, tenant=None,
             'value', None)
         if ncfg['encryptboot'] in ('', 'none'):
             ncfg['encryptboot'] = None
+        # one line of arguments, the installers read it with grep
+        installedargs = ' '.join(str(deployinfo.get(
+            'deployment.installedargs', {}).get('value', None) or '').split())
+        if installedargs:
+            ncfg['installedargs'] = installedargs
         ncfg['profile'] = profile
         protocol = deployinfo.get('deployment.useinsecureprotocols', {}).get(
             'value', 'never')

@@ -269,6 +269,8 @@ class WebConnection:
             self.host = f'[{host}]'
         else:
             self.host = host
+        scheme = 'http' if port == 80 else 'https'
+        self.baseurl = f'{scheme}://{self.host}:{self.port}'
         if verifycallback:
             self.ssl = CustomVerifier(verifycallback)
         else:
@@ -321,7 +323,7 @@ class WebConnection:
         newwc.cookies = CookieJar(quote_cookie=False, unsafe=True)
         for cookie in self.cookies:
             newwc.cookies.update_cookies(
-                {cookie.key: cookie.value}, response_url=URL(f'https://{self.host}:{self.port}/'))
+                {cookie.key: cookie.value}, response_url=URL(self.baseurl + '/'))
         return newwc
 
     async def request(
@@ -340,7 +342,7 @@ class WebConnection:
             headers['referer'] = referer
         method = method.lower()
         async with self._session(
-                f'https://{self.host}:{self.port}', cookie_jar=self.cookies, timeout=self.timeout) as session:
+                self.baseurl, cookie_jar=self.cookies, timeout=self.timeout) as session:
             thefunc = getattr(session, method)
             kwargs = {}
             if isinstance(body, dict):
@@ -390,7 +392,7 @@ class WebConnection:
         method = method.lower()
         if 'Content-Type' in headers and method.lower() in ('get', 'delete'):
             del headers['Content-Type']
-        async with self._session(f'https://{self.host}:{self.port}', cookie_jar=self.cookies, timeout=self.timeout) as session:
+        async with self._session(self.baseurl, cookie_jar=self.cookies, timeout=self.timeout) as session:
             thefunc = getattr(session, method)
             kwargs = {}
             if isinstance(data, dict):
@@ -420,7 +422,7 @@ class WebConnection:
         dlheaders = self.stdheaders.copy()
         if 'Accept-Encoding' in dlheaders:
             del dlheaders['Accept-Encoding']
-        async with self._session(f'https://{self.host}:{self.port}', cookie_jar=self.cookies, timeout=self.timeout) as session:
+        async with self._session(self.baseurl, cookie_jar=self.cookies, timeout=self.timeout) as session:
             async with session.get(url, headers=dlheaders, ssl=self.ssl) as rsp:
                 if downloader:
                     downloader.contentlen = rsp.headers.get('content-length', None)
@@ -439,7 +441,7 @@ class WebConnection:
             data = uploader.get_buffer()
         else:
             raise Exception("Not implemented without uploader handler")
-        async with self._session(f'https://{self.host}:{self.port}', cookie_jar=self.cookies, timeout=self.timeout) as session:
+        async with self._session(self.baseurl, cookie_jar=self.cookies, timeout=self.timeout) as session:
             async with session.post(url, headers=upheaders, ssl=self.ssl, data=data) as rsp:
                 if rsp.status >= 200 and rsp.status < 300:
                     expect_type = rsp.headers.get('Content-Type', '')

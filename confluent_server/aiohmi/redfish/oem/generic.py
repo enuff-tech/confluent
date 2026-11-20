@@ -284,6 +284,7 @@ class OEMHandler(object):
         self._varsensormapvintage = 0
         self._gpool = gpool
         self._varsysinfo = sysinfo
+        self._varchassisinfo = None
         self._varsysurl = sysurl
         self._varbmcurl = None
         self._urlcache = cache
@@ -412,6 +413,8 @@ class OEMHandler(object):
     
     async def sysinfo(self):
         sysurl = await self.get_default_sysurl()
+        if not sysurl:
+            return None
         return await self._do_web_request(sysurl)
     
     async def get_bmc_csr(self, keytype=None, keylength=None, cn=None, city=None,
@@ -589,6 +592,50 @@ class OEMHandler(object):
                         await self._do_web_request(cert['@odata.id'], method='DELETE')
                         self._invalidate_url_cache(certcoll)
                         return True
+        raise exc.PyghmiException(f'No such certificate found: {certid}')
+
+    async def get_trusted_uefi_cas(self):
+        sysinfo = await self.sysinfo()
+        caurl = sysinfo.get('Boot', {}).get('Certificates', {}).get('@odata.id', None)
+        if not caurl:
+            return
+        cas = await self._get_expanded_data(caurl)
+        cas = cas.get('Members', [])
+        for ca in cas:
+            cadesc = {
+                'id': ca.get('Id', ''),
+                'name': ca.get('Name', ''),
+                'pem': ca.get('CertificateString', None),
+                'subject': ca.get('Subject', {}).get('CommonName', ''),
+                'sans': ca.get('Subject', {}).get('AlternativeNames', []),
+                'issuer': ca.get('Issuer', {}).get('CommonName', ''),
+                'validfrom': ca.get('ValidNotBefore', ''),
+                'validto': ca.get('ValidNotAfter', ''),
+            }
+            yield cadesc
+
+    async def add_trusted_uefi_ca(self, pemdata):
+        sysinfo = await self.sysinfo()
+        caurl = sysinfo.get('Boot', {}).get('Certificates', {}).get('@odata.id', None)
+        if not caurl:
+            raise exc.PyghmiException('Platform does not support UEFI CAs')
+        certpayload = _pem_to_dict(pemdata, uefi=True)
+        await self._do_web_request(caurl, certpayload)
+        self._invalidate_url_cache(caurl)
+        return True
+
+    async def del_trusted_uefi_ca(self, certid):
+        sysinfo = await self.sysinfo()
+        caurl = sysinfo.get('Boot', {}).get('Certificates', {}).get('@odata.id', None)
+        if not caurl:
+            raise exc.PyghmiException('Platform does not support UEFI CAs')
+        cas = await self._get_expanded_data(caurl)
+        cas = cas.get('Members', [])
+        for ca in cas:
+            if ca.get('Id', '') == certid:
+                await self._do_web_request(ca['@odata.id'], method='DELETE')
+                self._invalidate_url_cache(caurl)
+                return True
         raise exc.PyghmiException(f'No such certificate found: {certid}')
 
     async def get_trusted_cas(self):
@@ -792,6 +839,8 @@ class OEMHandler(object):
 
     async def get_health(self, fishclient, verbose=True):
         sysinfo = await self.sysinfo()
+        if not sysinfo:  # might be a chassis only bmc
+            sysinfo = await self._get_chassis_info()
         health = sysinfo.get('Status', {})
         health = health.get('HealthRollup', health.get('Health', 'Unknown'))
         warnunknown = health == 'Unknown'
@@ -1225,6 +1274,7 @@ class OEMHandler(object):
 
     async def get_inventory_descriptions(self, withids=False):
         yield "System"
+        yield 'Chassis'
         self._hwnamemap = {}
         async for cpu in self._get_cpu_inventory(True, withids):
             yield cpu
@@ -1235,23 +1285,72 @@ class OEMHandler(object):
 
     async def _get_node_info(self):
         nodeinfo = self._varsysinfo
-        if not nodeinfo:
+        if nodeinfo:
+            return nodeinfo  
+        return await self._get_chassis_info()
+
+    DEFAULT_CHASSIS_IDS = ()
+    async def _get_chassis_url(self):
+
+        if not hasattr(self, '_varchassisurl'):
+            self._varchassisurl = None
+        if not self._varchassisurl:
             overview = await self._do_web_request('/redfish/v1/')
             chassismembs = overview.get('Chassis', {}).get('@odata.id', None)
-            if not chassismembs:
+            if chassismembs:
+                chassislist = await self._do_web_request(chassismembs)
+                chassismembs = chassislist.get('Members') or []
+                if len(chassismembs) == 1:
+                    self._varchassisurl = chassismembs[0]['@odata.id']
+                elif len(chassismembs) > 1:
+                    for chassis in chassismembs:
+                        chassisurl = chassis['@odata.id']
+                        if chassisurl.split('/')[-1] in self.DEFAULT_CHASSIS_IDS:
+                            self._varchassisurl = chassisurl
+                            break
+        return self._varchassisurl
+
+
+
+
+    async def _get_chassis_info(self):
+        nodeinfo = None
+        if self._varchassisinfo:
+            return self._varchassisinfo
+        else:
+            chassisurl = await self._get_chassis_url()
+            if not chassisurl:
                 return nodeinfo
-            chassislist = await self._do_web_request(chassismembs)
-            chassismembs = chassislist.get('Members', [])
-            if len(chassismembs) == 1:
-                chassisurl = chassismembs[0]['@odata.id']
-                nodeinfo = await self._do_web_request(chassisurl)
+            nodeinfo = await self._do_web_request(chassisurl)
         return nodeinfo
+
+    async def _get_chassis_inventory(self):
+        chassisinfo = await self._get_chassis_info()
+        retinfo = {}
+        snum = chassisinfo.get('SerialNumber', '').strip()
+        if snum:
+            retinfo['Serial Number'] = snum
+        mfr = chassisinfo.get('Manufacturer', '').strip()
+        if mfr:
+            retinfo['Manufacturer'] = mfr
+        pname = chassisinfo.get('Model', '').strip()
+        if pname:
+            retinfo['Product name'] = pname
+        model = chassisinfo.get('SKU', '').strip()
+        partnum = chassisinfo.get('PartNumber', '').strip()
+        if model:
+            retinfo['Model'] = model
+            if partnum:
+                retinfo['Part Number'] = partnum
+        elif partnum:
+            retinfo['Model'] = partnum
+        return retinfo
 
     async def get_inventory_of_component(self, component):
         if component.lower() == 'system':
             nodeinfo = await self._get_node_info()
             sysinfo = {
-                'UUID': nodeinfo.get('UUID', '').lower(),
+                'UUID': (nodeinfo.get('UUID') or '').lower(),
                 'Serial Number': nodeinfo.get('SerialNumber', ''),
                 'Manufacturer': nodeinfo.get('Manufacturer', ''),
                 'Product name': nodeinfo.get('Model', ''),
@@ -1266,6 +1365,8 @@ class OEMHandler(object):
             sysinfo['UUID'] = sysinfo['UUID'].lower()
 
             return sysinfo
+        elif component.lower() == 'chassis':
+            return await self._get_chassis_inventory()
         else:
             async for invpair in self.get_inventory():
                 if invpair[0].lower() == component.lower():
@@ -1273,7 +1374,7 @@ class OEMHandler(object):
 
     async def get_inventory(self, withids=False):
         sysinfo = {
-            'UUID': self._varsysinfo.get('UUID', ''),
+            'UUID': self._varsysinfo.get('UUID') or '',
             'Serial Number': self._varsysinfo.get('SerialNumber', ''),
             'Manufacturer': self._varsysinfo.get('Manufacturer', ''),
             'Product name': self._varsysinfo.get('Model', ''),
@@ -1287,6 +1388,7 @@ class OEMHandler(object):
                 sysinfo['UUID'][20:]))
         sysinfo['UUID'] = sysinfo['UUID'].lower()
         yield ('System', sysinfo)
+        yield ('Chassis', await self._get_chassis_inventory())
         self._hwnamemap = {}
         adpurls = await self._get_adp_urls()
         diskurls = await self._get_disk_urls()

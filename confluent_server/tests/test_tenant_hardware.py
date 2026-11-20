@@ -125,7 +125,7 @@ async def test_ssh_reaches_the_tenants_own_host(topo):
     assert topo.decoy_hits() == hits
 
 
-async def test_blocking_http_clients_reach_the_tenants_own_pdu(topo):
+async def test_pdu_http_clients_reach_the_tenants_own_pdu(topo):
     import confluent.plugins.hardwaremanagement.deltapdu as deltapdu
     import confluent.plugins.hardwaremanagement.eatonpdu as eatonpdu
     hits = topo.decoy_hits()
@@ -138,8 +138,11 @@ async def test_blocking_http_clients_reach_the_tenants_own_pdu(topo):
     for tid, (label, _) in TENANTS.items():
         tenantnet.enter(tid)
         try:
+            # the Delta PDU client is aiohmi's web client over plain http
+            page, status = await deltapdu.WebConnection(HW_IP).grab_response('/')
+            assert status == 200
+            assert (page.decode() if isinstance(page, bytes) else page) == label
             # blocking clients run in executor threads, which carry the tenant
-            assert await asyncio.to_thread(fetch, deltapdu.WebConnection(HW_IP)) == label
             assert await asyncio.to_thread(fetch, eatonpdu.PlainWebConnection(HW_IP)) == label
         finally:
             tenantnet.enter(None)

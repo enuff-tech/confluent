@@ -474,8 +474,17 @@ def number_to_addr(number):
     return addr
 
 def iterate_addrs(addrs, countonly=False):
-    if '.' not in addrs:
-        raise exc.InvalidArgumentException('IPv4 only supported')
+    if isinstance(addrs, list):
+        if countonly:
+            yield len(addrs)
+            return
+        for addr in addrs:
+            for a in iterate_addrs(addr, countonly=countonly):
+                yield a
+        return
+    if ':' in addrs:
+        if '-' in addrs or '/' in addrs:
+            raise exc.InvalidArgumentException('IPv6 ranges not supported')
     if '-' in addrs:
         first, last = addrs.split('-', 1)
         currn = addr_to_number(first)
@@ -597,17 +606,24 @@ def save_subscriptions(subs):
 
 async def register_remote_addrs(addresses, configmanager):
     async def register_remote_addr(addr):
+        addrinfo = await asyncio.get_running_loop().getaddrinfo(addr, 443, type=socket.SOCK_STREAM)
+        sockaddr = addrinfo[0][4]
+        hwaddr = await neighutil.get_hwaddr(addr)
         nd = {
-            'addresses': [(addr, 443)]
+            'addresses': [sockaddr]
         }
+        if hwaddr:
+            nd['hwaddr'] = hwaddr
         try:
             sd = await ssdp.check_fish(('/DeviceDescription.json', nd))
             if not sd:
-                return addr, await generic_eval(addr)
+                return addr, await generic_eval(addr, hwaddr)
             if 'macaddress' in sd['attributes']:
                 sd['hwaddr'] = sd['attributes']['macaddress']
-            else:
+            elif 'mac-address' in sd['attributes']:
                 sd['hwaddr'] = sd['attributes']['mac-address']
+            elif hwaddr:
+                sd['hwaddr'] = hwaddr
             if 'lenovo-xcc3' in sd['services']:
                 nh = xcc3.NodeHandler(sd, configmanager)
             elif 'lenovo-xcc' in sd['services']:
@@ -625,6 +641,17 @@ async def register_remote_addrs(addresses, configmanager):
         else:
             yield msg.ConfluentResourceNotFound(result[0])
 
+
+async def probe_noderange(configmanager, scannoderange):
+    nr = noderange.NodeRange(scannoderange, configmanager)
+    alladdrs = []
+    await macmap.rescan(configmanager)
+    for node in nr.nodes:
+        async for addr in macmap.get_possible_node_addresses(node, configmanager):
+            alladdrs.append(addr)
+    async for x in  register_remote_addrs(alladdrs, configmanager):
+        yield x
+    
 
 async def handle_api_request(configmanager, inputdata, operation, pathcomponents):
     if pathcomponents == ['discovery', 'autosense']:
@@ -671,6 +698,8 @@ async def handle_api_request(configmanager, inputdata, operation, pathcomponents
         return (msg.KeyValueData({'status': 'unsubscribed'}),)
     elif operation in ('update', 'create'):
         if pathcomponents == ['discovery', 'register']:
+            if 'noderange' in inputdata:
+                return probe_noderange(configmanager, inputdata['noderange'])
             if 'addresses' not in inputdata:
                 raise exc.InvalidArgumentException('Missing address in input')
             return register_remote_addrs(inputdata['addresses'], configmanager)

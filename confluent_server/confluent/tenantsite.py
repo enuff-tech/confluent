@@ -36,7 +36,10 @@ import confluent.tenantpaths as tenantpaths
 import confluent.tenantssh as tenantssh
 
 IPXE_SOURCE = '/opt/confluent/lib/ipxe'
-IPXE_FILES = ('ipxe-shim.efi', 'ipxe.efi', 'ipxe-aarch64-shim.efi', 'ipxe-aarch64.efi')
+# (packaged name, architecture directory, name there), as osdeploy lays them out
+IPXE_FILES = (('ipxe-shim.efi', 'x86_64', 'ipxe-shim.efi'), ('ipxe.efi', 'x86_64', 'ipxe.efi'),
+              ('ipxe-aarch64-shim.efi', 'aarch64', 'ipxe-shim.efi'),
+              ('ipxe-aarch64.efi', 'aarch64', 'ipxe.efi'))
 
 
 def _write(path, data, mode=0o644):
@@ -124,11 +127,12 @@ async def ensure(tenant):
                 tar.add(os.path.join(sitedir, name), arcname=name)
     _write(os.path.join(sitedir, 'initramfs.tgz'), packed.getvalue())
     # the boot loader offered for HTTP boot, as osdeploy copies it
-    for name in IPXE_FILES:
+    for name, arch, archname in IPXE_FILES:
         source = os.path.join(IPXE_SOURCE, name)
-        target = os.path.join(public, 'ipxe', name)
+        target = os.path.join(public, 'ipxe', arch, archname)
         if os.path.exists(source) and not os.path.exists(target):
             _mkdir(os.path.join(public, 'ipxe'))
+            _mkdir(os.path.join(public, 'ipxe', arch))
             shutil.copy(source, target)
             os.chmod(target, 0o644)
     return sitedir

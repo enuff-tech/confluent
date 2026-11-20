@@ -70,6 +70,14 @@ def _public(*parts):
     net = _tenant_net()
     return tenantpaths.public_path(None if net is None else net.tenant, *parts)
 
+def _kernelargs_boot(cfd, node):
+    """Whether the node gets its boot script from /confluent-api/boot/by-node
+    (deployment.kernelargs appended). That API serves the default tenant's
+    nodes; a tenant's node boots its profile's own script."""
+    if _tenant_net() is not None:
+        return False
+    return bool(cfd.get(node, {}).get('deployment.kernelargs', {}).get('value', None))
+
 mcastv6addr = 'ff02::1:2'
 
 
@@ -143,7 +151,7 @@ pxearchs = {
     b'\x00\x09': 'uefi-x64',
     b'\x00\x0b': 'uefi-aarch64',
     b'\x00\x10': 'uefi-httpboot',
-    b'\x00\x13': 'uefi-httpboot',  # arm httpboot
+    b'\x00\x13': 'uefi-httpboot-arm',  # arm httpboot
 }
 
 
@@ -341,7 +349,7 @@ async def proxydhcp(handler, nodeguess, tenant=None):
                 node, ('deployment.*', 'collective.managercandidates'))
             if disco['arch'] is None:
                 continue
-            if disco['arch'] == 'uefi-httpboot':
+            if disco['arch'] in ('uefi-httpboot', 'uefi-httpboot-arm'):
                 # HTTP boot is offered by the DHCP path, not proxyDHCP
                 continue
             if tenant is not None and opts.get(77, None) != b'iPXE':
@@ -352,7 +360,7 @@ async def proxydhcp(handler, nodeguess, tenant=None):
                 {}).get('value', 'never')
             if not insecuremode:
                 insecuremode = 'never'
-            if insecuremode == 'never':
+            if insecuremode == 'never' and opts.get(77, None) != b'iPXE':
                 if not skiplogging:
                     log.log(
                         {'info': 'Boot attempt by {0} detected in insecure mode, but '
@@ -361,6 +369,9 @@ async def proxydhcp(handler, nodeguess, tenant=None):
                                 '`always` to enable support, or use UEFI HTTP boot '
                                 'with HTTPS.'.format(node)})
                 continue
+            webproto = 'http'
+            if insecuremode == 'never':
+                webproto = 'https'
             profile = None
             if not myipn:
                 myipn = socket.inet_aton(recv)
@@ -379,10 +390,13 @@ async def proxydhcp(handler, nodeguess, tenant=None):
                     log.log({'info': 'No pending profile for {0}, skipping proxyDHCP reply'.format(node)})
                     continue
                 myip = socket.inet_ntoa(myipn)
+                bootbase = '{0}://{1}/confluent-public/os/{2}/boot.'.format(webproto, myip, profile)
+                if _kernelargs_boot(cfd, node):
+                    bootbase = '{0}://{1}/confluent-api/boot/by-node/{2}/'.format(webproto, myip, node)
                 if disco['arch'] == 'bios-x86' or not os.path.exists(_public('os', profile, 'boot.ipxe.shim')):
-                    bootfile = 'http://{0}/confluent-public/os/{1}/boot.ipxe'.format(myip, profile).encode('utf8')
+                    bootfile = (bootbase + 'ipxe').encode('utf8')
                 else:
-                    bootfile = 'http://{0}/confluent-public/os/{1}/boot.ipxe.shim'.format(myip, profile).encode('utf8')
+                    bootfile = (bootbase + 'ipxe.shim').encode('utf8')
             elif disco['arch'] == 'uefi-x64':
                 bootfile = b'confluent/x86_64/ipxe-shim.efi'
             elif disco['arch'] == 'bios-x86':
@@ -443,8 +457,18 @@ def new_dhcp6_packet(handler, net6, cfg, nodeguess):
     if len(pkt) < 64:
         return
     rqv = memoryview(pkt)
-    if rqv[0] in (1, 3):
+    if rqv[0] in (1, 3, 11):  # solicit, request, information-request
         tasks.spawn(process_dhcp6req(handler, rqv, addr, net6, cfg, nodeguess))
+    elif rqv[0] == 8:  # release, firmware retransmits it until answered
+        req, _ = v6opts_to_dict(bytearray(rqv[4:]))
+        serverid = b'\x00\x04' + get_my_duid()
+        if 1 in req and req.get(2, b'') == serverid:
+            reply = bytearray(rqv[:4])
+            reply[0] = 7
+            reply += struct.pack('!HH', 1, len(req[1])) + req[1]
+            reply += struct.pack('!HH', 2, len(serverid)) + serverid
+            reply += struct.pack('!HHH', 13, 2, 0)  # status code success
+            net6.sendto(reply, addr)
 
 
 async def _tenant_snoop(handler, nodeguess, tenant):
@@ -541,6 +565,8 @@ async def process_dhcp6req(handler, rqv, addr, net, cfg, nodeguess):
     req, disco = v6opts_to_dict(bytearray(rqv[4:]))
     req['txid'] = rqv[1:4]
     req['rqtype'] = bytearray(rqv[:1])[0]
+    if req['rqtype'] == 3 and req.get(2, b'') != b'\x00\x04' + get_my_duid():
+        return  # request for another server
     if not disco.get('uuid', None) or not disco.get('arch', None):
         return
     if disco['uuid'] == '03000200-0400-0500-0006-000700080009':
@@ -684,7 +710,7 @@ async def check_reply(node, info, packet, sock, cfg, reqview, addr, requestor):
         if addr:
             niccfg = await netutil.get_nic_config(cfg, node, ifidx=addr[-1], onlyfamily=socket.AF_INET6)
         else:
-            niccfg = await netutil.get_nic_config(cfg, node, ifidx=info['netinfo']['ifidx'], onlyfamily=socket.AF_INET)
+            niccfg = await netutil.get_nic_config(cfg, node, ifidx=info['netinfo']['ifidx'], onlyfamily=socket.AF_INET, mac=info.get('hwaddr'))
         if not niccfg.get('lease_time'):
             return  # ignore DHCP from local non-PXE segment
     cfd = cfg.get_node_attributes(node, ('deployment.*', 'collective.managercandidates'))
@@ -699,12 +725,13 @@ async def check_reply(node, info, packet, sock, cfg, reqview, addr, requestor):
                 )})
             return
     if addr:
-        if packet['vci'] and packet['vci'].startswith('PXEClient'):
+        if (packet['vci'] and packet['vci'].startswith('PXEClient')
+                and packet.get(15, b'')[2:] != b'iPXE'):
             log.log({'info': 'IPv6 PXE boot attempt by {0}, but IPv6 PXE is not supported, try IPv6 HTTP boot or IPv4 boot'.format(node)})
             return
         return await reply_dhcp6(node, addr, cfg, packet, cfd, profile, sock)
     else:
-        httpboot = info.get('architecture', None) == 'uefi-httpboot'
+        httpboot = info.get('architecture', None) in ('uefi-httpboot', 'uefi-httpboot-arm')
         return await reply_dhcp4(node, info, packet, cfg, reqview, httpboot, cfd, profile, sock, requestor, niccfg=niccfg)
 
 async def reply_dhcp6(node, addr, cfg, packet, cfd, profile, sock, niccfg=None):
@@ -726,15 +753,34 @@ async def reply_dhcp6(node, addr, cfg, packet, cfd, profile, sock, niccfg=None):
     if not insecuremode:
         insecuremode = 'never'
     proto = 'https' if insecuremode == 'never' else 'http'
-    bootfile = '{0}://[{1}]/confluent-public/os/{2}/boot.img'.format(
-        proto, ipv6srvaddr, profile
-    )
+    isipxe = packet.get(15, b'')[2:] == b'iPXE'
+    bootarch = pxearchs.get(bytes(packet[61]), None)
+    shimarch = 'aarch64' if bootarch in ('uefi-aarch64', 'uefi-httpboot-arm') else 'x86_64'
+    hasshim = os.path.exists(_public('os', profile, 'boot.ipxe.shim'))
+    if isipxe:
+        bootfile = '{0}://[{1}]/confluent-public/os/{2}/boot.ipxe'.format(
+            proto, ipv6srvaddr, profile
+        )
+        if _kernelargs_boot(cfd, node):
+            bootfile = '{0}://[{1}]/confluent-api/boot/by-node/{2}/ipxe'.format(
+                proto, ipv6srvaddr, node
+            )
+        if hasshim and bootarch != 'bios-x86':
+            bootfile += '.shim'
+    elif hasshim and os.path.exists(_public('ipxe', shimarch, 'ipxe-shim.efi')):
+        bootfile = '{0}://[{1}]/confluent-public/ipxe/{2}/ipxe-shim.efi'.format(
+            proto, ipv6srvaddr, shimarch
+        )
+    else:
+        bootfile = '{0}://[{1}]/confluent-public/os/{2}/boot.img'.format(
+            proto, ipv6srvaddr, profile
+        )
     if not isinstance(bootfile, bytes):
         bootfile = bootfile.encode('utf8')
     ipass = []
     if ipv6method == 'firmwarenone':
         return
-    if ipv6method not in ('dhcp', 'firmwaredhcp') and ipv6addr:
+    if ipv6method not in ('dhcp', 'firmwaredhcp') and ipv6addr and 3 in packet:
         if not ipv6prefix:
             log.log({'info': 'Unable to determine prefix to serve to address {} for node {}'.format(ipv6addr, node)})
             return
@@ -743,10 +789,13 @@ async def reply_dhcp6(node, addr, cfg, packet, cfd, profile, sock, niccfg=None):
         ipass[4:16] = b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x05\x00\x18'
         ipass[16:32] = socket.inet_pton(socket.AF_INET6, ipv6addr)
         ipass[32:40] = b'\x00\x00\x00\x78\x00\x00\x01\x2c'
-    elif (not packet['vci']) or not packet['vci'].startswith(
-            'HTTPClient:Arch:'):
-        # do not send ip-less replies to anything but HTTPClient specifically
+    elif not isipxe and ((not packet['vci']) or not packet['vci'].startswith(
+            'HTTPClient:Arch:')):
+        # do not send ip-less replies to anything but HTTPClient and iPXE
         return
+    if (packet['rqtype'] == 1 and bootfile.endswith(b'/boot.img')
+            and cfd.get(node, {}).get('deployment.kernelargs', {}).get('value', None)):
+        log.log({'warning': 'deployment.kernelargs of {0} is not applied, UEFI HTTP boot of profile {1} falls back to boot.img, run osdeploy initialize -r to install the iPXE shim'.format(node, profile)})
     # 1 msgtype
     # 3 txid
     # 22 - server ident
@@ -803,7 +852,9 @@ async def reply_dhcp4(node, info, packet, cfg, reqview, httpboot, cfd, profile, 
         requestor = ('0.0.0.0', None)
     if info.get('architecture', None) is None:
         isboot = False
+    bootarch = info.get('architecture', None)
     rqtype = packet[53][0]
+    insecuremode = 'never'  # needed here for non-boot case to keep code simpler
     if (isboot and _tenant_net() is not None and not httpboot
             and packet.get(77, None) != b'iPXE'):
         # Firmware PXE fetches its boot file by TFTP, which is not served
@@ -819,7 +870,7 @@ async def reply_dhcp4(node, info, packet, cfg, reqview, httpboot, cfd, profile, 
             {}).get('value', 'never')
         if not insecuremode:
             insecuremode = 'never'
-        if insecuremode == 'never' and not httpboot:
+        if insecuremode == 'never' and not httpboot and packet.get(77, None) != b'iPXE':
             if (rqtype == 1 and info.get('architecture', None)
                     and time.time() > ignoremacs.get(info['hwaddr'], 0) + 90):
                 ignoremacs[info['hwaddr']] = time.time()
@@ -853,7 +904,7 @@ async def reply_dhcp4(node, info, packet, cfg, reqview, httpboot, cfd, profile, 
         relayipa = socket.inet_ntoa(relayip)
     gateway = None
     netmask = None
-    niccfg = await netutil.get_nic_config(cfg, node, ifidx=info['netinfo']['ifidx'], relayipn=relayip, onlyfamily=socket.AF_INET)
+    niccfg = await netutil.get_nic_config(cfg, node, ifidx=info['netinfo']['ifidx'], relayipn=relayip, onlyfamily=socket.AF_INET, mac=info.get('hwaddr'))
     nicerr = niccfg.get('error_msg', False)
     if nicerr:
         log.log({'error': nicerr})
@@ -887,21 +938,31 @@ async def reply_dhcp4(node, info, packet, cfg, reqview, httpboot, cfd, profile, 
         log.log({'error': 'Unable to serve {} due to duplicated address between node and interface index "{}"'.format(node, info['netinfo']['ifidx'])})
         return
     can302 = True
+    proto = 'https' if insecuremode == 'never' else 'http'
     if isboot and httpboot:
-        proto = 'https' if insecuremode == 'never' else 'http'
-        if (proto == 'http'
+        shimarch = 'aarch64' if bootarch == 'uefi-httpboot-arm' else 'x86_64'
+        if (proto in ('http', 'https')
                 and os.path.exists(_public('os', profile, 'boot.ipxe.shim'))
-                and os.path.exists(_public('ipxe', 'ipxe-shim.efi'))):
-            bootfile = '{0}://{1}/confluent-public/ipxe/ipxe-shim.efi'.format(
-                proto, myipn
-            )
-            bootshorturl = '/confluent-public/ipxe/ipxe-shim.efi'
-            bootfilename = _public('ipxe', 'ipxe-shim.efi')
+                and os.path.exists(_public('ipxe', shimarch, 'ipxe-shim.efi'))):
+            if bootarch == 'uefi-httpboot':
+                bootfile = '{0}://{1}/confluent-public/ipxe/x86_64/ipxe-shim.efi'.format(
+                    proto, myipn
+                )
+                bootshorturl = '/confluent-public/ipxe/x86_64/ipxe-shim.efi'
+                bootfilename = _public('ipxe', 'x86_64', 'ipxe-shim.efi')
+            elif bootarch == 'uefi-httpboot-arm':
+                bootfile = '{0}://{1}/confluent-public/ipxe/aarch64/ipxe-shim.efi'.format(
+                    proto, myipn
+                )
+                bootshorturl = '/confluent-public/ipxe/aarch64/ipxe-shim.efi'
+                bootfilename = _public('ipxe', 'aarch64', 'ipxe-shim.efi')
         else:
             bootfile = '{0}://{1}/confluent-public/os/{2}/boot.img'.format(
                 proto, myipn, profile
             )
             bootshorturl = '/confluent-public/os/{0}/boot.img'.format(profile)
+            if rqtype == 1 and cfd.get(node, {}).get('deployment.kernelargs', {}).get('value', None):
+                log.log({'warning': 'deployment.kernelargs of {0} is not applied, UEFI HTTP boot of profile {1} falls back to boot.img, run osdeploy initialize -r to install the iPXE shim'.format(node, profile)})
             bootfilename = _public('os', profile, 'boot.img')
             can302 = False
         if not isinstance(bootfile, bytes):
@@ -924,10 +985,13 @@ async def reply_dhcp4(node, info, packet, cfg, reqview, httpboot, cfd, profile, 
             if not profile:
                 log.log({'info': 'No pending profile for {0}, skipping proxyDHCP reply'.format(node)})
                 return
+            bootbase = '{0}://{1}/confluent-public/os/{2}/boot.'.format(proto, myipn, profile)
+            if _kernelargs_boot(cfd, node):
+                bootbase = '{0}://{1}/confluent-api/boot/by-node/{2}/'.format(proto, myipn, node)
             if not os.path.exists(_public('os', profile, 'boot.ipxe.shim')):
-                bootfile = 'http://{0}/confluent-public/os/{1}/boot.ipxe'.format(myipn, profile).encode('utf8')
+                bootfile = (bootbase + 'ipxe').encode('utf8')
             else:
-                bootfile = 'http://{0}/confluent-public/os/{1}/boot.ipxe.shim'.format(myipn, profile).encode('utf8')
+                bootfile = (bootbase + 'ipxe.shim').encode('utf8')
             if len(bootfile) > 127:
                 if bootfile.startswith(b'http'):
                     bootfile = register_shorturl(bootfile.decode('utf8')).encode('utf8')
@@ -968,7 +1032,7 @@ async def reply_dhcp4(node, info, packet, cfg, reqview, httpboot, cfd, profile, 
     # we will simply always do it to provide the boot payload in a consistent
     # matter to both dhcp-elsewhere and fixed ip clients
     if isboot:
-        if info.get('architecture', None) == 'uefi-httpboot':
+        if info.get('architecture', None) in ('uefi-httpboot', 'uefi-httpboot-arm'):
             repview[replen - 1:replen + 11] = b'\x3c\x0aHTTPClient'
             replen += 12
         else:
@@ -1015,6 +1079,8 @@ async def reply_dhcp4(node, info, packet, cfg, reqview, httpboot, cfd, profile, 
         del staticassigns[fulladdr]
     if httpboot:
         boottype = 'HTTP'
+    elif packet.get(77, None) == b'iPXE':
+        boottype = 'iPXE'
     else:
         boottype = 'PXE'
     deferanswer = None
@@ -1090,7 +1156,7 @@ async def ack_request_full(pkt, rq, info, sock, requestor, hwaddr, addr):
         return # TODO(jjohnson2): Handle IPv6 requests
         #niccfg = await netutil.get_nic_config(cfg, node, ifidx=addr[-1], onlyfamily=socket.AF_INET6)
     else:
-        niccfg = await netutil.get_nic_config(cfg, node, ifidx=info['netinfo']['ifidx'], onlyfamily=socket.AF_INET)
+        niccfg = await netutil.get_nic_config(cfg, node, ifidx=info['netinfo']['ifidx'], onlyfamily=socket.AF_INET, mac=hwaddr)
     leasetime = niccfg.get('lease_time')
     if not leasetime:
         return  # ignore open ended requests when we don't have lease_time
