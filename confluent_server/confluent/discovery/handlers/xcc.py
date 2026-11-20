@@ -276,7 +276,15 @@ class NodeHandler(immhandler.NodeHandler):
                 wc = await self.get_wc()
                 await self.set_password_policy('', wc)
             return (wc, pwdchanged)
-        elif rspdata.get('locktime', 0) > 0:
+        if not isinstance(rspdata, dict):
+            # a refused login comes back as the raw body
+            try:
+                rspdata = json.loads(rspdata)
+            except (TypeError, ValueError):
+                rspdata = {}
+            if not isinstance(rspdata, dict):
+                rspdata = {}
+        if rspdata.get('locktime', 0) > 0:
             raise LockedUserException(
                 'The user "{0}" has been locked out by too many incorrect password attempts'.format(username))
         return (None, rspdata)
